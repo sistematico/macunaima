@@ -1,2 +1,9 @@
+.idea/
 venv/
-*.old.commit
+credentials.py
+*.log
+*.old
+*.old.*
+pickle
+__pycache__
+.commit

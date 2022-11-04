@@ -10,6 +10,7 @@ from macunaima.ddg import search
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+URL = os.environ.get('URL', 'https://macunaima.fly.dev/')
 TOKEN = os.environ.get('TOKEN')
 MODE = os.environ.get('MODE', 'production')
 
@@ -30,7 +31,7 @@ def main() -> None:
     if MODE.startswith('dev'):
         updater.start_polling() # Polling
     else:
-        updater.start_webhook(listen="0.0.0.0", port=8080, url_path=TOKEN, webhook_url="https://macunaima.fly.dev/" + TOKEN) # Webhook
+        updater.start_webhook(listen="0.0.0.0", port=8080, url_path=TOKEN, webhook_url=URL + TOKEN) # Webhook
     
     updater.idle()
 
