@@ -4,7 +4,6 @@ import os
 import logging
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
-from macunaima.decorators import rate_limited
 from macunaima.ddg import search
 
 # Enable logging
@@ -18,12 +17,9 @@ def start(update: Update, context: CallbackContext) -> None:
     update.message.reply_text('Olá!')
 
 def ddg(update: Update, context: CallbackContext) -> None:
-    termo = update.message.text.partition(' ')[2] 
-    
-    if termo:
-        resultado = search(termo)
+    if update.message.text.partition(' ')[2]:
+        resultado = search(update.message.text.partition(' ')[2])
         update.message.reply_text(resultado)
-        # context.bot.send_message('Olá!')
 
 def main() -> None:
     updater = Updater(TOKEN)

@@ -3,18 +3,23 @@ import requests
 
 url = 'https://api.duckduckgo.com/?format=json&q='
 
-def search(term)-> str | dict:
+result = {
+    'text': 'Sem resultados',
+    'url': None
+}
+
+def search(term: str)-> dict | str:
     response = requests.get(url + term)
     json_response = response.json()
     
     if response.status_code != 200:
         return 'Erro ao consultar'
     elif json_response['Results']:
-        # return json_response['Results'][0]['FirstURL'])
-        # print(json_response['Results'][0]['Text'])
-        return json_response['Results'][0]
-    elif json_response['AbstractURL']:
-        # abstract = json_response['AbstractURL']
-        return json_response['AbstractURL']
+        result['text'] = json_response['Results'][0]['Text']
+        result['url'] = json_response['Results'][0]['FirstURL']
+    elif json_response['Abstract']:
+        result['text'] = json_response['Abstract']
     else:
-        return 'Nada encontrado'
+        result['text'] = 'Nada encontrado'
+
+    return result
