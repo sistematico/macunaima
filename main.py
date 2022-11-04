@@ -20,7 +20,12 @@ def start(update: Update, context: CallbackContext) -> None:
 def ddg(update: Update, context: CallbackContext) -> None:
     if update.message.text.partition(' ')[2]:
         resultado = search(update.message.text.partition(' ')[2])
-        update.message.reply_text(resultado)
+
+        update.message.reply_text(
+            resultado['text'] +
+            f'\n\n' +
+            resultado['url']
+            , disable_web_page_preview=True)
 
 def main() -> None:
     updater = Updater(TOKEN)
