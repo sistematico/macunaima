@@ -1,0 +1,20 @@
+name = "macunaima"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+
+[vars]
+# Confidence threshold (0.0 – 1.0) above which a message is deleted
+SPAM_THRESHOLD = "0.80"
+# Number of spam warnings before the user is banned
+MAX_WARNINGS = "3"
+# Gemini model to use for spam analysis
+GEMINI_MODEL = "gemini-2.0-flash"
+
+# Secrets (set via `wrangler secret put`):
+#   BOT_TOKEN        – Telegram bot token from @BotFather
+#   GOOGLE_AI_API_KEY – Google AI Studio API key
+
+[[kv_namespaces]]
+binding = "SPAM_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
