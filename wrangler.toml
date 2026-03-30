@@ -8,7 +8,15 @@ SPAM_THRESHOLD = "0.80"
 # Number of spam warnings before the user is banned
 MAX_WARNINGS = "3"
 # Gemini model to use for spam analysis
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-1.5-flash"
+# Minutes a new member has to solve the captcha before being kicked
+CAPTCHA_TIMEOUT_MINUTES = "5"
+# Confidence threshold for profile-based removal (photo + bio analysis)
+PROFILE_CHECK_THRESHOLD = "0.85"
+
+[triggers]
+# Checks every minute for members who did not answer the captcha in time
+crons = ["* * * * *"]
 
 # Secrets (set via `wrangler secret put`):
 #   BOT_TOKEN        – Telegram bot token from @BotFather
@@ -16,5 +24,5 @@ GEMINI_MODEL = "gemini-2.0-flash"
 
 [[kv_namespaces]]
 binding = "SPAM_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+id = "5755c0ea91e34f7dba1cee29d7cdadd5"
+preview_id = "59e7efa296f84f44acccb1df8e4ac1a1"

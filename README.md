@@ -4,6 +4,9 @@ Bot de moderação para grupos do Telegram que usa a IA do Google Gemini para de
 
 ## Funcionalidades
 
+- **Sistema de warns** com configuração por grupo (limite, punição) e comandos completos de gestão
+- **Verificação de perfil:** ao entrar, a foto de perfil e a bio são analisadas pelo Gemini; perfis com conteúdo adulto/sexual são removidos antes mesmo do captcha
+- **Captcha de boas-vindas:** novo membro recebe um desafio matemático via botão inline; sem resposta em N minutos é removido automaticamente
 - Analisa cada mensagem de membros comuns com o Gemini AI
 - Remove automaticamente mensagens identificadas como spam
 - Sistema de avisos por usuário (persistido no Cloudflare KV)
@@ -99,6 +102,8 @@ Edite o `wrangler.toml` para ajustar os parâmetros do bot:
 | `SPAM_THRESHOLD` | `0.80` | Confiança mínima (0–1) para considerar spam |
 | `MAX_WARNINGS` | `3` | Avisos antes do ban automático |
 | `GEMINI_MODEL` | `gemini-2.0-flash` | Modelo Gemini a utilizar |
+| `CAPTCHA_TIMEOUT_MINUTES` | `5` | Minutos para responder ao captcha antes de ser removido |
+| `PROFILE_CHECK_THRESHOLD` | `0.85` | Confiança mínima para remoção por perfil com conteúdo adulto |
 
 ---
 
@@ -231,8 +236,10 @@ curl "https://api.telegram.org/botSEU_TOKEN/getWebhookInfo"
 1. Adicione o bot ao grupo do Telegram
 2. **Promova o bot a administrador** com as seguintes permissões:
    - ✅ Deletar mensagens
-   - ✅ Banir usuários
+   - ✅ Banir usuários (necessário para o captcha e o ban automático)
 3. O bot começará a monitorar as mensagens automaticamente
+
+> **Como funciona o captcha:** ao entrar no grupo, o novo membro recebe uma mensagem com 4 botões contendo uma conta simples (ex: "Quanto é 3 + 7?"). Se clicar na resposta correta, o captcha é removido e ele é bem-vindo. Se clicar errado, é removido na hora. Se ignorar, o cron job da Cloudflare verifica a cada minuto e remove quem estiver com o prazo vencido. O usuário removido **não é banido permanentemente** — pode tentar entrar novamente.
 
 ---
 
@@ -248,6 +255,72 @@ macunaima/
 ├── tsconfig.json
 └── README.md
 ```
+
+---
+
+## Comandos disponíveis
+
+Todos os comandos de moderação são exclusivos para administradores, exceto `/warns`.
+
+### Sistema de warns
+
+| Comando | Descrição |
+|---|---|
+| `/warn [motivo]` | Adverte o usuário (em resposta ou mencionando) |
+| `/unwarn` | Remove um aviso do usuário |
+| `/resetwarns` | Zera todos os avisos do usuário |
+| `/warns` | Consulta os avisos de um usuário (ou os próprios) |
+| `/setwarnlimit <1–20>` | Define o máximo de avisos antes da punição |
+| `/setwarnpunishment <ban\|kick\|mute>` | Define a punição ao atingir o limite |
+
+**Punições disponíveis:**
+- `ban` — banimento permanente *(padrão)*
+- `kick` — remove do grupo sem banir (pode voltar)
+- `mute` — silencia permanentemente no grupo
+
+**Como usar `/warn`:**
+```
+# Respondendo a mensagem de alguém:
+/warn
+
+# Respondendo com motivo:
+/warn enviou link suspeito
+
+# Mencionando diretamente:
+/warn @usuário comportamento inadequado
+```
+
+A mensagem respondida e o comando `/warn` são deletados automaticamente. O bot responde com o nome do usuário, contagem atual e limite de avisos.
+
+**Configuração por grupo** (cada grupo tem suas próprias configurações):
+```
+/setwarnlimit 5
+/setwarnpunishment kick
+```
+
+---
+
+## Deploy automático via GitHub Actions
+
+O repositório inclui um workflow (`.github/workflows/deploy.yml`) que executa o deploy automaticamente a cada push na branch `main`. Ele também pode ser acionado manualmente pela aba **Actions** do repositório.
+
+### Configurar os secrets no GitHub
+
+Acesse **Settings → Secrets and variables → Actions → New repository secret** e adicione:
+
+| Secret | Como obter |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | Cloudflare Dashboard → **My Profile → API Tokens → Create Token** → use o template **Edit Cloudflare Workers** |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Dashboard → **Workers & Pages** → ID exibido na barra lateral direita |
+
+### Passos do workflow
+
+1. **Checkout** — clona o repositório
+2. **Install** — `pnpm install --frozen-lockfile` (garante reproducibilidade)
+3. **Type check** — `tsc --noEmit` (bloqueia o deploy se houver erro de tipos)
+4. **Deploy** — `wrangler deploy` autenticado com os secrets acima
+
+> **Atenção:** os secrets `BOT_TOKEN` e `GOOGLE_AI_API_KEY` do bot **não** precisam estar no GitHub — eles já estão armazenados diretamente no Cloudflare Workers via `wrangler secret put` e o deploy não os apaga.
 
 ---
 

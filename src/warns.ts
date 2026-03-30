@@ -1,0 +1,398 @@
+import type { Bot, Context } from "grammy";
+import type { MessageEntity, User } from "grammy/types";
+import type { Env } from "./index";
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+
+export type Punishment = "ban" | "kick" | "mute";
+
+export interface GroupConfig {
+  maxWarns: number;
+  punishment: Punishment;
+}
+
+const DEFAULT_CONFIG: GroupConfig = { maxWarns: 3, punishment: "ban" };
+
+// ── KV helpers ─────────────────────────────────────────────────────────────────
+
+const warnKey = (chatId: number, userId: number) =>
+  `warns:${chatId}:${userId}`;
+const configKey = (chatId: number) => `group_config:${chatId}`;
+
+async function getConfig(
+  kv: KVNamespace,
+  chatId: number
+): Promise<GroupConfig> {
+  return (
+    (await kv.get<GroupConfig>(configKey(chatId), "json")) ?? {
+      ...DEFAULT_CONFIG,
+    }
+  );
+}
+
+async function saveConfig(
+  kv: KVNamespace,
+  chatId: number,
+  patch: Partial<GroupConfig>
+): Promise<GroupConfig> {
+  const updated = { ...(await getConfig(kv, chatId)), ...patch };
+  await kv.put(configKey(chatId), JSON.stringify(updated));
+  return updated;
+}
+
+export async function getWarnCount(
+  kv: KVNamespace,
+  chatId: number,
+  userId: number
+): Promise<number> {
+  return parseInt((await kv.get(warnKey(chatId, userId))) ?? "0", 10);
+}
+
+async function addWarn(
+  kv: KVNamespace,
+  chatId: number,
+  userId: number
+): Promise<number> {
+  const next = (await getWarnCount(kv, chatId, userId)) + 1;
+  await kv.put(warnKey(chatId, userId), String(next));
+  return next;
+}
+
+async function removeWarn(
+  kv: KVNamespace,
+  chatId: number,
+  userId: number
+): Promise<number> {
+  const current = await getWarnCount(kv, chatId, userId);
+  const next = Math.max(0, current - 1);
+  if (next === 0) await kv.delete(warnKey(chatId, userId));
+  else await kv.put(warnKey(chatId, userId), String(next));
+  return next;
+}
+
+async function clearWarns(
+  kv: KVNamespace,
+  chatId: number,
+  userId: number
+): Promise<void> {
+  await kv.delete(warnKey(chatId, userId));
+}
+
+// ── Utilities ──────────────────────────────────────────────────────────────────
+
+const PUNISHMENT_LABEL: Record<Punishment, string> = {
+  ban: "banido permanentemente",
+  kick: "removido do grupo",
+  mute: "silenciado permanentemente",
+};
+
+function mention(user: User): string {
+  return `<a href="tg://user?id=${user.id}">${user.first_name}</a>`;
+}
+
+/**
+ * Strips "/command[@bot] [mention]" from the message text and returns the rest
+ * as the warn reason.
+ */
+function parseReason(text: string, entities: MessageEntity[]): string {
+  const cmdMatch = /^\/\w+(?:@\S+)?\s*/i.exec(text);
+  const cmdEnd = cmdMatch?.[0].length ?? 0;
+  let result = text.slice(cmdEnd);
+
+  // If the first remaining entity is a mention, strip it too
+  for (const e of entities) {
+    if (e.type !== "mention" && e.type !== "text_mention") continue;
+    if (e.offset - cmdEnd === 0) {
+      result = result.slice(e.length).trimStart();
+      break;
+    }
+  }
+
+  return result.trim();
+}
+
+/**
+ * Resolves the target user from:
+ *  1. The replied-to message
+ *  2. A text_mention entity (clickable, carries User object)
+ *  3. A @username mention (resolved via getChat)
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function resolveTarget(ctx: any): Promise<User | null> {
+  // 1. Reply
+  const reply = ctx.message?.reply_to_message;
+  if (reply?.from && !reply.from.is_bot) return reply.from as User;
+
+  const entities: MessageEntity[] = ctx.message?.entities ?? [];
+  const text: string = ctx.message?.text ?? "";
+
+  for (const e of entities) {
+    // 2. Clickable mention (text_mention carries the full User object)
+    if (e.type === "text_mention") {
+      if (!e.user.is_bot) return e.user;
+      continue;
+    }
+
+    // 3. Plain @username — resolve via Telegram
+    if (e.type === "mention") {
+      const username = text.slice(e.offset + 1, e.offset + e.length);
+      try {
+        const chat = await (ctx.api as Context["api"]).getChat(
+          `@${username}`
+        );
+        if (chat.type === "private") {
+          return {
+            id: chat.id,
+            first_name: chat.first_name,
+            is_bot: false,
+          } as User;
+        }
+      } catch {
+        /* unknown or private username */
+      }
+    }
+  }
+
+  return null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function isAdmin(ctx: any, userId: number): Promise<boolean> {
+  try {
+    const m = await ctx.getChatMember(userId);
+    return m.status === "administrator" || m.status === "creator";
+  } catch {
+    return false;
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function applyPunishment(ctx: any, chatId: number, userId: number, p: Punishment): Promise<void> {
+  if (p === "ban") {
+    await ctx.api.banChatMember(chatId, userId);
+  } else if (p === "kick") {
+    await ctx.api.banChatMember(chatId, userId);
+    await ctx.api.unbanChatMember(chatId, userId);
+  } else {
+    // mute: strip all send permissions
+    await ctx.api.restrictChatMember(chatId, userId, {
+      permissions: {
+        can_send_messages: false,
+        can_send_audios: false,
+        can_send_documents: false,
+        can_send_photos: false,
+        can_send_videos: false,
+        can_send_video_notes: false,
+        can_send_voice_notes: false,
+        can_send_polls: false,
+        can_send_other_messages: false,
+        can_add_web_page_previews: false,
+      },
+    });
+  }
+}
+
+// ── Command registration ───────────────────────────────────────────────────────
+
+export function registerWarnCommands(bot: Bot, env: Env): void {
+  const kv = env.SPAM_KV;
+
+  const groupOnly = async (ctx: Context): Promise<boolean> => {
+    if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") return false;
+    return true;
+  };
+
+  const requireAdmin = async (ctx: Context): Promise<boolean> => {
+    if (!ctx.from) return false;
+    if (await isAdmin(ctx, ctx.from.id)) return true;
+    await ctx.reply("❌ Apenas administradores podem usar este comando.");
+    return false;
+  };
+
+  // ── /warn ──────────────────────────────────────────────────────────────────
+
+  bot.command("warn", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const target = await resolveTarget(ctx);
+    if (!target) {
+      await ctx.reply(
+        "❌ Responda a uma mensagem ou mencione o usuário.\n" +
+          "Exemplos:\n" +
+          "• <code>/warn motivo</code> (respondendo a mensagem)\n" +
+          "• <code>/warn @usuário motivo</code>",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (await isAdmin(ctx, target.id)) {
+      await ctx.reply("❌ Não é possível advertir um administrador.");
+      return;
+    }
+
+    const reason = parseReason(
+      ctx.message?.text ?? "",
+      ctx.message?.entities ?? []
+    );
+
+    // Delete both messages silently
+    const replied = ctx.message?.reply_to_message;
+    if (replied) {
+      await ctx.api
+        .deleteMessage(ctx.chat!.id, replied.message_id)
+        .catch(() => undefined);
+    }
+    await ctx.deleteMessage().catch(() => undefined);
+
+    const config = await getConfig(kv, ctx.chat!.id);
+    const warnCount = await addWarn(kv, ctx.chat!.id, target.id);
+
+    if (warnCount >= config.maxWarns) {
+      try {
+        await applyPunishment(ctx, ctx.chat!.id, target.id, config.punishment);
+        await clearWarns(kv, ctx.chat!.id, target.id);
+      } catch {
+        /* no permission */
+      }
+      await ctx.reply(
+        `🚫 ${mention(target)} atingiu <b>${warnCount}/${config.maxWarns}</b> avisos.\n` +
+          `Punição: <b>${PUNISHMENT_LABEL[config.punishment]}</b>` +
+          (reason ? `\n📝 Motivo: <i>${reason}</i>` : ""),
+        { parse_mode: "HTML" }
+      );
+    } else {
+      await ctx.reply(
+        `⚠️ ${mention(target)} recebeu um aviso.\n` +
+          `📊 Avisos: <b>${warnCount}/${config.maxWarns}</b>` +
+          (reason ? `\n📝 Motivo: <i>${reason}</i>` : ""),
+        { parse_mode: "HTML" }
+      );
+    }
+  });
+
+  // ── /unwarn ────────────────────────────────────────────────────────────────
+
+  bot.command("unwarn", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const target = await resolveTarget(ctx);
+    if (!target) {
+      await ctx.reply("❌ Responda a uma mensagem ou mencione o usuário.");
+      return;
+    }
+
+    await ctx.deleteMessage().catch(() => undefined);
+
+    const warnCount = await removeWarn(kv, ctx.chat!.id, target.id);
+    const config = await getConfig(kv, ctx.chat!.id);
+
+    await ctx.reply(
+      `✅ Um aviso de ${mention(target)} foi removido.\n` +
+        `📊 Avisos: <b>${warnCount}/${config.maxWarns}</b>`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ── /resetwarns ────────────────────────────────────────────────────────────
+
+  bot.command("resetwarns", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const target = await resolveTarget(ctx);
+    if (!target) {
+      await ctx.reply("❌ Responda a uma mensagem ou mencione o usuário.");
+      return;
+    }
+
+    await ctx.deleteMessage().catch(() => undefined);
+    await clearWarns(kv, ctx.chat!.id, target.id);
+
+    const config = await getConfig(kv, ctx.chat!.id);
+
+    await ctx.reply(
+      `🔄 Todos os avisos de ${mention(target)} foram zerados.\n` +
+        `📊 Avisos: <b>0/${config.maxWarns}</b>`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ── /warns ─────────────────────────────────────────────────────────────────
+
+  bot.command("warns", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+
+    // Default to the caller when no target is specified
+    const target = (await resolveTarget(ctx)) ?? ctx.from;
+    if (!target) return;
+
+    const warnCount = await getWarnCount(kv, ctx.chat!.id, target.id);
+    const config = await getConfig(kv, ctx.chat!.id);
+
+    await ctx.reply(
+      `📊 Avisos de ${mention(target)}: <b>${warnCount}/${config.maxWarns}</b>\n` +
+        `Punição ao atingir o limite: <i>${PUNISHMENT_LABEL[config.punishment]}</i>`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ── /setwarnlimit ──────────────────────────────────────────────────────────
+
+  bot.command("setwarnlimit", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const text = ctx.message?.text ?? "";
+    const match = /^\/setwarnlimit(?:@\S+)?\s+(\d+)/i.exec(text);
+    const n = match ? parseInt(match[1]!, 10) : NaN;
+
+    if (isNaN(n) || n < 1 || n > 20) {
+      await ctx.reply(
+        "❌ Uso: <code>/setwarnlimit &lt;1–20&gt;</code>",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const config = await saveConfig(kv, ctx.chat!.id, { maxWarns: n });
+    await ctx.deleteMessage().catch(() => undefined);
+    await ctx.reply(
+      `✅ Limite de avisos: <b>${config.maxWarns}</b>\n` +
+        `Punição atual: <i>${PUNISHMENT_LABEL[config.punishment]}</i>`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ── /setwarnpunishment ─────────────────────────────────────────────────────
+
+  bot.command("setwarnpunishment", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const text = ctx.message?.text ?? "";
+    const match = /^\/setwarnpunishment(?:@\S+)?\s+(ban|kick|mute)/i.exec(text);
+    const punishment = match?.[1]?.toLowerCase() as Punishment | undefined;
+
+    if (!punishment) {
+      await ctx.reply(
+        "❌ Uso: <code>/setwarnpunishment &lt;ban|kick|mute&gt;</code>\n\n" +
+          "• <b>ban</b> — banimento permanente\n" +
+          "• <b>kick</b> — remove do grupo (pode voltar)\n" +
+          "• <b>mute</b> — silencia permanentemente",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const config = await saveConfig(kv, ctx.chat!.id, { punishment });
+    await ctx.deleteMessage().catch(() => undefined);
+    await ctx.reply(
+      `✅ Punição definida: <b>${PUNISHMENT_LABEL[config.punishment]}</b>\n` +
+        `Limite atual: <i>${config.maxWarns} avisos</i>`,
+      { parse_mode: "HTML" }
+    );
+  });
+}

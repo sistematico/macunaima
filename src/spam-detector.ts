@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { withRetry } from "./retry";
 
 export interface SpamAnalysis {
   isSpam: boolean;
@@ -59,7 +60,7 @@ export async function analyzeMessage(
     linksSection
   );
 
-  const result = await generativeModel.generateContent(prompt);
+  const result = await withRetry(() => generativeModel.generateContent(prompt));
   const responseText = result.response.text().trim();
 
   const parsed = JSON.parse(responseText) as SpamAnalysis;
