@@ -226,7 +226,7 @@ function createBot(env: Env): Bot {
     const entities = message.entities ?? message.caption_entities ?? [];
     const links = extractLinks(text, entities);
 
-    let analysis;
+    let analysis: Awaited<ReturnType<typeof analyzeMessage>>;
     try {
       analysis = await analyzeMessage(
         text,
