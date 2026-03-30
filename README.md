@@ -108,6 +108,8 @@ Edite o `wrangler.toml` para ajustar os parâmetros do bot:
 | `GEMINI_MODEL` | `gemini-2.0-flash` | Modelo Gemini a utilizar |
 | `CAPTCHA_TIMEOUT_MINUTES` | `5` | Minutos para responder ao captcha antes de ser removido |
 | `PROFILE_CHECK_THRESHOLD` | `0.85` | Confiança mínima para remoção por perfil com conteúdo adulto |
+| `OFFENSIVE_THRESHOLD` | `0.90` | Confiança mínima para auto-warn por conteúdo ofensivo (alto para evitar falsos positivos) |
+| `GEMINI_THROTTLE_SECONDS` | `60` | Segundos de cooldown por usuário entre chamadas ao Gemini |
 
 ---
 
@@ -273,6 +275,7 @@ Todos os comandos de moderação são exclusivos para administradores, exceto `/
 | `/ping` | Verifica se o bot está ativo e mostra a latência |
 | `/setlogchannel @canal` | Define o canal de logs para o grupo |
 | `/unsetlogchannel` | Remove o canal de logs configurado |
+| `/setoffensive on\|off` | Ativa ou desativa detecção de conteúdo ofensivo no grupo |
 
 ### Sistema de warns
 

@@ -1,13 +1,21 @@
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import type { MessageEntity } from "grammy/types";
-import { analyzeMessage } from "./spam-detector";
+import { analyzeContent } from "./spam-detector";
+import { isThrottled, setThrottle } from "./throttle";
 import { captchaKey, generateCaptcha, type CaptchaData } from "./captcha";
 import {
   checkProfilePhoto,
   checkProfileText,
   fetchUserBio,
 } from "./profile-checker";
-import { registerWarnCommands } from "./warns";
+import {
+  registerWarnCommands,
+  getConfig,
+  addWarn,
+  clearWarns,
+  applyPunishment,
+  PUNISHMENT_LABEL,
+} from "./warns";
 import {
   getLogChannel,
   setLogChannel,
@@ -25,6 +33,8 @@ export interface Env {
   GEMINI_MODEL: string;
   CAPTCHA_TIMEOUT_MINUTES: string;
   PROFILE_CHECK_THRESHOLD: string;
+  OFFENSIVE_THRESHOLD: string;
+  GEMINI_THROTTLE_SECONDS: string;
   SPAM_KV: KVNamespace;
 }
 
@@ -73,12 +83,14 @@ function extractLinks(text: string, entities: MessageEntity[]): string[] {
 function createBot(env: Env): Bot {
   const bot = new Bot(env.BOT_TOKEN);
 
-  const threshold = parseFloat(env.SPAM_THRESHOLD ?? "0.80");
+  const spamThreshold = parseFloat(env.SPAM_THRESHOLD ?? "0.80");
+  const offensiveThreshold = parseFloat(env.OFFENSIVE_THRESHOLD ?? "0.90");
   const maxWarnings = parseInt(env.MAX_WARNINGS ?? "3", 10);
-  const geminiModel = env.GEMINI_MODEL ?? "gemini-2.0-flash";
+  const geminiModel = env.GEMINI_MODEL ?? "gemini-1.5-flash";
   const timeoutMinutes = parseFloat(env.CAPTCHA_TIMEOUT_MINUTES ?? "5");
   const timeoutMs = timeoutMinutes * 60 * 1000;
   const profileThreshold = parseFloat(env.PROFILE_CHECK_THRESHOLD ?? "0.85");
+  const throttleSeconds = parseInt(env.GEMINI_THROTTLE_SECONDS ?? "60", 10);
 
   // ── Warn commands ─────────────────────────────────────────────────────────
   registerWarnCommands(bot, env);
@@ -330,7 +342,7 @@ function createBot(env: Env): Bot {
     }
   });
 
-  // ── Spam detection ─────────────────────────────────────────────────────────
+  // ── Content analysis: spam + offensive (one Gemini call, throttled) ────────
 
   bot.on("message", async (ctx) => {
     const { chat, from, message } = ctx;
@@ -340,81 +352,125 @@ function createBot(env: Env): Bot {
 
     try {
       const member = await ctx.getChatMember(from.id);
-      if (member.status === "administrator" || member.status === "creator") {
-        return;
-      }
-    } catch {
-      // proceed with analysis if membership check fails
-    }
+      if (member.status === "administrator" || member.status === "creator") return;
+    } catch { /* proceed */ }
 
     const text = message.text ?? message.caption ?? "";
     if (text.length < 8) return;
 
+    // Skip if this user was already checked recently
+    if (await isThrottled(env.SPAM_KV, chat.id, from.id)) return;
+
     const entities = message.entities ?? message.caption_entities ?? [];
     const links = extractLinks(text, entities);
 
-    let analysis: Awaited<ReturnType<typeof analyzeMessage>>;
+    let analysis: Awaited<ReturnType<typeof analyzeContent>>;
     try {
-      analysis = await analyzeMessage(
-        text,
-        links,
-        env.GOOGLE_AI_API_KEY,
-        geminiModel
-      );
+      analysis = await analyzeContent(text, links, env.GOOGLE_AI_API_KEY, geminiModel);
     } catch (err) {
       console.error("Gemini analysis failed:", err);
       return;
     }
 
-    if (!analysis.isSpam || analysis.confidence < threshold) return;
+    // Mark user as recently checked — regardless of result
+    await setThrottle(env.SPAM_KV, chat.id, from.id, throttleSeconds);
 
-    try {
-      await ctx.deleteMessage();
-    } catch {
-      // no delete permission
-    }
-
-    const warnings = await incrementWarnings(env.SPAM_KV, chat.id, from.id);
-    // chat is already narrowed to group|supergroup above
     const chatTitle = (chat as { title: string }).title;
     const userMention = from.username
       ? `@${from.username}`
       : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
 
-    // Log the deleted spam message
-    await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
-      `🗑️ <b>SPAM REMOVIDO</b>\n\n` +
-      `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
-      `📋 Categoria: <i>${esc(analysis.category)}</i>\n` +
-      `📊 Confiança: <b>${Math.round(analysis.confidence * 100)}%</b>  Aviso: <b>${warnings}/${maxWarnings}</b>\n` +
-      `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
-    );
+    // ── Spam (takes priority over offensive) ─────────────────────────────────
 
-    if (warnings >= maxWarnings) {
-      try {
-        await ctx.banChatMember(from.id);
-        await ctx.reply(`🚫 ${userMention} foi banido por spam repetido.`, {
-          parse_mode: "HTML",
-        });
-        await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
-          `🚫 <b>BAN POR SPAM</b>\n\n` +
-          `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
-          `📊 Avisos de spam atingidos: <b>${warnings}/${maxWarnings}</b>`
-        );
-      } catch {
+    if (analysis.isSpam && analysis.spamConfidence >= spamThreshold) {
+      try { await ctx.deleteMessage(); } catch { /* no permission */ }
+
+      const warnings = await incrementWarnings(env.SPAM_KV, chat.id, from.id);
+
+      await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+        `🗑️ <b>SPAM REMOVIDO</b>\n\n` +
+        `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+        `📋 Categoria: <i>${esc(analysis.spamCategory)}</i>\n` +
+        `📊 Confiança: <b>${Math.round(analysis.spamConfidence * 100)}%</b>  Aviso spam: <b>${warnings}/${maxWarnings}</b>\n` +
+        `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+      );
+
+      if (warnings >= maxWarnings) {
+        try {
+          await ctx.banChatMember(from.id);
+          await ctx.reply(`🚫 ${userMention} foi banido por spam repetido.`, { parse_mode: "HTML" });
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `🚫 <b>BAN POR SPAM</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `📊 Avisos de spam: <b>${warnings}/${maxWarnings}</b>`
+          );
+        } catch {
+          await ctx.reply(
+            `⛔ ${userMention} atingiu o limite de avisos (${maxWarnings}/${maxWarnings}). ` +
+              `Não tenho permissão para banir — por favor, remova manualmente.`,
+            { parse_mode: "HTML" }
+          );
+        }
+      } else {
         await ctx.reply(
-          `⛔ ${userMention} atingiu o limite de avisos (${maxWarnings}/${maxWarnings}). ` +
-            `Não tenho permissão para banir — por favor, remova manualmente.`,
+          `⚠️ Mensagem de ${userMention} removida por spam.\n` +
+            `📋 Categoria: <i>${analysis.spamCategory}</i>\n` +
+            `📊 Aviso spam ${warnings}/${maxWarnings}`,
           { parse_mode: "HTML" }
         );
       }
-    } else {
-      await ctx.reply(
-        `⚠️ Mensagem de ${userMention} removida por spam.\n` +
-          `📋 Categoria: <i>${analysis.category}</i>\n` +
-          `📊 Aviso ${warnings}/${maxWarnings}`,
-        { parse_mode: "HTML" }
+      return;
+    }
+
+    // ── Offensive content (uses the /warn system, per-group configurable) ─────
+
+    if (analysis.isOffensive && analysis.offensiveConfidence >= offensiveThreshold) {
+      const groupConfig = await getConfig(env.SPAM_KV, chat.id);
+      if (!groupConfig.offensiveDetection) return;
+
+      try { await ctx.deleteMessage(); } catch { /* no permission */ }
+
+      const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id);
+
+      await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+        `🤬 <b>CONTEÚDO OFENSIVO REMOVIDO</b>\n\n` +
+        `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+        `📋 Categoria: <i>${esc(analysis.offensiveCategory)}</i>\n` +
+        `📊 Confiança: <b>${Math.round(analysis.offensiveConfidence * 100)}%</b>\n` +
+        `📊 Avisos: <b>${warnCount}/${groupConfig.maxWarns}</b>\n` +
+        `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
       );
+
+      if (warnCount >= groupConfig.maxWarns) {
+        try {
+          await applyPunishment(ctx.api, chat.id, from.id, groupConfig.punishment);
+          await clearWarns(env.SPAM_KV, chat.id, from.id);
+          await ctx.reply(
+            `🚫 ${userMention} atingiu <b>${warnCount}/${groupConfig.maxWarns}</b> avisos.\n` +
+              `Punição: <b>${PUNISHMENT_LABEL[groupConfig.punishment]}</b>\n` +
+              `📝 Motivo: <i>conteúdo ofensivo (automático)</i>`,
+            { parse_mode: "HTML" }
+          );
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `🚫 <b>PUNIÇÃO APLICADA (OFENSIVO)</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `⚖️ Punição: <b>${PUNISHMENT_LABEL[groupConfig.punishment]}</b>\n` +
+            `📊 Avisos: <b>${warnCount}/${groupConfig.maxWarns}</b>`
+          );
+        } catch {
+          await ctx.reply(
+            `⛔ ${userMention} atingiu o limite de avisos. Não tenho permissão para aplicar a punição — remova manualmente.`,
+            { parse_mode: "HTML" }
+          );
+        }
+      } else {
+        await ctx.reply(
+          `⚠️ ${userMention} recebeu um aviso automático por conteúdo ofensivo.\n` +
+            `📋 Categoria: <i>${analysis.offensiveCategory}</i>\n` +
+            `📊 Avisos: <b>${warnCount}/${groupConfig.maxWarns}</b>`,
+          { parse_mode: "HTML" }
+        );
+      }
     }
   });
 

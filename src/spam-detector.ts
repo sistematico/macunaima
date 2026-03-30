@@ -1,50 +1,87 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { withRetry } from "./retry";
 
-export interface SpamAnalysis {
+// ── Types ──────────────────────────────────────────────────────────────────────
+
+export interface ContentAnalysis {
   isSpam: boolean;
+  spamConfidence: number;
+  spamCategory: string;
+  isOffensive: boolean;
+  offensiveConfidence: number;
+  offensiveCategory: string;
   reason: string;
-  confidence: number;
-  category: string;
 }
 
-const SPAM_PROMPT = `You are a spam detection system for a Telegram group moderation bot.
+// ── Combined prompt ────────────────────────────────────────────────────────────
+//
+// One call → two results. Halves API usage compared to two separate checks.
+//
+// The offensive threshold in the prompt is intentionally very strict to
+// minimise false positives. Adjust OFFENSIVE_THRESHOLD in wrangler.toml
+// (default 0.90) independently from the LLM guidance below.
 
-Analyze the message below and determine whether it is spam.
+const PROMPT = `You are a content moderation assistant for a Telegram group bot.
+Analyze the message and evaluate it for TWO independent issues.
 
-SPAM indicators:
-- Unsolicited advertising or promotional content
-- Phishing or credential harvesting attempts
+━━ 1. SPAM ━━
+Flag as spam if the message is:
+- Unsolicited ads, promotions or commercial offers
+- Phishing, credential harvesting or account takeover attempts
 - Cryptocurrency / investment / forex scams or pump-and-dump schemes
-- Fake giveaways, prizes, or lottery scams
-- MLM or pyramid scheme recruitment
-- Suspicious or obfuscated links (bit.ly, t.me/+XXX invite floods, etc.)
-- Adult content solicitation
-- Message flooding / repetitive content
+- Fake giveaways, prizes, lottery or sweepstakes
+- MLM / pyramid scheme recruitment
+- Suspicious or obfuscated links (bit.ly, t.me/+xxx invite floods, etc.)
+- Adult content solicitation or escort/prostitution offers
+- Repetitive flooding
 - Job scams ("easy money", "work from home" with suspicious links)
 
-NOT spam:
-- Normal conversation or questions
-- Sharing legitimate news articles
-- Personal opinions or reactions
-- Commands or replies to the bot
+NOT spam: normal conversation, questions, legitimate news, opinions, bot commands.
 
-Message to analyze:
+━━ 2. OFFENSIVE CONTENT ━━
+Be EXTREMELY conservative — only flag content that is CLEARLY and UNAMBIGUOUSLY offensive.
+A false positive (removing a normal message) is far worse than a false negative.
+
+Flag offensive ONLY if the message contains:
+- Explicit hate speech clearly targeting race, ethnicity, religion, gender or sexual orientation
+- Direct, credible personal threats of physical violence against a named person
+- Highly explicit sexual content (graphic descriptions, not just innuendo)
+- Severe, targeted personal harassment aimed at a specific group member
+
+Do NOT flag:
+- Profanity, cursing or strong language alone
+- Heated political debate or strong opinions
+- Dark or morbid humour, sarcasm, irony
+- Criticism of companies, public figures, governments or ideas
+- Venting or frustration
+- Cultural communication differences
+- Anything that could plausibly be interpreted as non-offensive
+
+━━ Message ━━
 """
 {{MESSAGE}}
 """
-{{LINKS_SECTION}}
-Respond ONLY with a valid JSON object (no markdown, no extra text):
-{"isSpam": <boolean>, "confidence": <0.0–1.0>, "category": "<category or 'legitimate'>", "reason": "<one sentence explanation>"}`;
+{{LINKS}}
+Respond with ONLY valid JSON (no markdown, no extra text):
+{
+  "isSpam": <boolean>,
+  "spamConfidence": <0.0–1.0>,
+  "spamCategory": "<category or 'legitimate'>",
+  "isOffensive": <boolean>,
+  "offensiveConfidence": <0.0–1.0>,
+  "offensiveCategory": "<category or 'clean'>",
+  "reason": "<one sentence>"
+}`;
 
-export async function analyzeMessage(
+// ── Analyser ───────────────────────────────────────────────────────────────────
+
+export async function analyzeContent(
   text: string,
   links: string[],
   apiKey: string,
   model: string
-): Promise<SpamAnalysis> {
+): Promise<ContentAnalysis> {
   const genAI = new GoogleGenerativeAI(apiKey);
-
   const generativeModel = genAI.getGenerativeModel({
     model,
     generationConfig: { responseMimeType: "application/json" },
@@ -52,17 +89,14 @@ export async function analyzeMessage(
 
   const linksSection =
     links.length > 0
-      ? `\nLinks found in message:\n${links.map((l) => `- ${l}`).join("\n")}\n`
+      ? `\nLinks in message:\n${links.map((l) => `- ${l}`).join("\n")}\n`
       : "";
 
-  const prompt = SPAM_PROMPT.replace("{{MESSAGE}}", text).replace(
-    "{{LINKS_SECTION}}",
+  const prompt = PROMPT.replace("{{MESSAGE}}", text).replace(
+    "{{LINKS}}",
     linksSection
   );
 
   const result = await withRetry(() => generativeModel.generateContent(prompt));
-  const responseText = result.response.text().trim();
-
-  const parsed = JSON.parse(responseText) as SpamAnalysis;
-  return parsed;
+  return JSON.parse(result.response.text().trim()) as ContentAnalysis;
 }

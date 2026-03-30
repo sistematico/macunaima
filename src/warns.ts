@@ -1,4 +1,4 @@
-import type { Bot, Context } from "grammy";
+import type { Api, Bot, Context } from "grammy";
 import type { MessageEntity, User } from "grammy/types";
 import type { Env } from "./index";
 import { sendLog, ulink, esc } from "./logger";
@@ -10,26 +10,21 @@ export type Punishment = "ban" | "kick" | "mute";
 export interface GroupConfig {
   maxWarns: number;
   punishment: Punishment;
+  /** Whether the bot should auto-warn for offensive content (default: true) */
+  offensiveDetection: boolean;
 }
 
-const DEFAULT_CONFIG: GroupConfig = { maxWarns: 3, punishment: "ban" };
+const DEFAULT_CONFIG: GroupConfig = {
+  maxWarns: 3,
+  punishment: "ban",
+  offensiveDetection: true,
+};
 
 // ── KV helpers ─────────────────────────────────────────────────────────────────
 
 const warnKey = (chatId: number, userId: number) =>
   `warns:${chatId}:${userId}`;
 const configKey = (chatId: number) => `group_config:${chatId}`;
-
-async function getConfig(
-  kv: KVNamespace,
-  chatId: number
-): Promise<GroupConfig> {
-  return (
-    (await kv.get<GroupConfig>(configKey(chatId), "json")) ?? {
-      ...DEFAULT_CONFIG,
-    }
-  );
-}
 
 async function saveConfig(
   kv: KVNamespace,
@@ -49,7 +44,7 @@ export async function getWarnCount(
   return parseInt((await kv.get(warnKey(chatId, userId))) ?? "0", 10);
 }
 
-async function addWarn(
+export async function addWarn(
   kv: KVNamespace,
   chatId: number,
   userId: number
@@ -71,7 +66,7 @@ async function removeWarn(
   return next;
 }
 
-async function clearWarns(
+export async function clearWarns(
   kv: KVNamespace,
   chatId: number,
   userId: number
@@ -79,9 +74,20 @@ async function clearWarns(
   await kv.delete(warnKey(chatId, userId));
 }
 
+export async function getConfig(
+  kv: KVNamespace,
+  chatId: number
+): Promise<GroupConfig> {
+  return (
+    (await kv.get<GroupConfig>(configKey(chatId), "json")) ?? {
+      ...DEFAULT_CONFIG,
+    }
+  );
+}
+
 // ── Utilities ──────────────────────────────────────────────────────────────────
 
-const PUNISHMENT_LABEL: Record<Punishment, string> = {
+export const PUNISHMENT_LABEL: Record<Punishment, string> = {
   ban: "banido permanentemente",
   kick: "removido do grupo",
   mute: "silenciado permanentemente",
@@ -167,28 +173,30 @@ async function isAdmin(ctx: any, userId: number): Promise<boolean> {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function applyPunishment(ctx: any, chatId: number, userId: number, p: Punishment): Promise<void> {
+export async function applyPunishment(
+  api: Api,
+  chatId: number,
+  userId: number,
+  p: Punishment
+): Promise<void> {
   if (p === "ban") {
-    await ctx.api.banChatMember(chatId, userId);
+    await api.banChatMember(chatId, userId);
   } else if (p === "kick") {
-    await ctx.api.banChatMember(chatId, userId);
-    await ctx.api.unbanChatMember(chatId, userId);
+    await api.banChatMember(chatId, userId);
+    await api.unbanChatMember(chatId, userId);
   } else {
     // mute: strip all send permissions
-    await ctx.api.restrictChatMember(chatId, userId, {
-      permissions: {
-        can_send_messages: false,
-        can_send_audios: false,
-        can_send_documents: false,
-        can_send_photos: false,
-        can_send_videos: false,
-        can_send_video_notes: false,
-        can_send_voice_notes: false,
-        can_send_polls: false,
-        can_send_other_messages: false,
-        can_add_web_page_previews: false,
-      },
+    await api.restrictChatMember(chatId, userId, {
+      can_send_messages: false,
+      can_send_audios: false,
+      can_send_documents: false,
+      can_send_photos: false,
+      can_send_videos: false,
+      can_send_video_notes: false,
+      can_send_voice_notes: false,
+      can_send_polls: false,
+      can_send_other_messages: false,
+      can_add_web_page_previews: false,
     });
   }
 }
@@ -254,7 +262,7 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
 
     if (warnCount >= config.maxWarns) {
       try {
-        await applyPunishment(ctx, ctx.chat!.id, target.id, config.punishment);
+        await applyPunishment(ctx.api, ctx.chat!.id, target.id, config.punishment);
         await clearWarns(kv, ctx.chat!.id, target.id);
       } catch {
         /* no permission */
@@ -423,6 +431,37 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
     await ctx.reply(
       `✅ Punição definida: <b>${PUNISHMENT_LABEL[config.punishment]}</b>\n` +
         `Limite atual: <i>${config.maxWarns} avisos</i>`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ── /setoffensive ──────────────────────────────────────────────────────────
+
+  bot.command("setoffensive", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const text = ctx.message?.text ?? "";
+    const match = /^\/setoffensive(?:@\S+)?\s+(on|off)/i.exec(text);
+    const value = match?.[1]?.toLowerCase();
+
+    if (!value) {
+      await ctx.reply(
+        "❌ Uso: <code>/setoffensive &lt;on|off&gt;</code>\n\n" +
+          "• <b>on</b> — ativa detecção automática de conteúdo ofensivo\n" +
+          "• <b>off</b> — desativa (spam ainda é detectado normalmente)",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const enabled = value === "on";
+    await saveConfig(kv, ctx.chat!.id, { offensiveDetection: enabled });
+    await ctx.deleteMessage().catch(() => undefined);
+    await ctx.reply(
+      enabled
+        ? "✅ Detecção de conteúdo ofensivo <b>ativada</b>."
+        : "✅ Detecção de conteúdo ofensivo <b>desativada</b>.",
       { parse_mode: "HTML" }
     );
   });
