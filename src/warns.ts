@@ -1,6 +1,7 @@
 import type { Bot, Context } from "grammy";
 import type { MessageEntity, User } from "grammy/types";
 import type { Env } from "./index";
+import { sendLog, ulink, esc } from "./logger";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -248,6 +249,8 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
 
     const config = await getConfig(kv, ctx.chat!.id);
     const warnCount = await addWarn(kv, ctx.chat!.id, target.id);
+    const chatTitle = (ctx.chat as { title: string }).title;
+    const admin = ctx.from!;
 
     if (warnCount >= config.maxWarns) {
       try {
@@ -262,12 +265,27 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
           (reason ? `\n📝 Motivo: <i>${reason}</i>` : ""),
         { parse_mode: "HTML" }
       );
+      await sendLog(ctx.api, kv, ctx.chat!.id, chatTitle,
+        `🚫 <b>PUNIÇÃO APLICADA</b>\n\n` +
+        `👤 Usuário: ${ulink(target.id, target.first_name)} <code>${target.id}</code>\n` +
+        `👮 Admin: ${ulink(admin.id, admin.first_name)}\n` +
+        `⚖️ Punição: <b>${PUNISHMENT_LABEL[config.punishment]}</b>\n` +
+        `📊 Avisos: <b>${warnCount}/${config.maxWarns}</b>` +
+        (reason ? `\n📝 Motivo: <i>${esc(reason)}</i>` : "")
+      );
     } else {
       await ctx.reply(
         `⚠️ ${mention(target)} recebeu um aviso.\n` +
           `📊 Avisos: <b>${warnCount}/${config.maxWarns}</b>` +
           (reason ? `\n📝 Motivo: <i>${reason}</i>` : ""),
         { parse_mode: "HTML" }
+      );
+      await sendLog(ctx.api, kv, ctx.chat!.id, chatTitle,
+        `⚠️ <b>AVISO APLICADO</b>\n\n` +
+        `👤 Usuário: ${ulink(target.id, target.first_name)} <code>${target.id}</code>\n` +
+        `👮 Admin: ${ulink(admin.id, admin.first_name)}\n` +
+        `📊 Avisos: <b>${warnCount}/${config.maxWarns}</b>` +
+        (reason ? `\n📝 Motivo: <i>${esc(reason)}</i>` : "")
       );
     }
   });
@@ -288,11 +306,18 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
 
     const warnCount = await removeWarn(kv, ctx.chat!.id, target.id);
     const config = await getConfig(kv, ctx.chat!.id);
+    const chatTitle = (ctx.chat as { title: string }).title;
 
     await ctx.reply(
       `✅ Um aviso de ${mention(target)} foi removido.\n` +
         `📊 Avisos: <b>${warnCount}/${config.maxWarns}</b>`,
       { parse_mode: "HTML" }
+    );
+    await sendLog(ctx.api, kv, ctx.chat!.id, chatTitle,
+      `✅ <b>AVISO REMOVIDO</b>\n\n` +
+      `👤 Usuário: ${ulink(target.id, target.first_name)} <code>${target.id}</code>\n` +
+      `👮 Admin: ${ulink(ctx.from!.id, ctx.from!.first_name)}\n` +
+      `📊 Avisos restantes: <b>${warnCount}/${config.maxWarns}</b>`
     );
   });
 
@@ -312,11 +337,17 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
     await clearWarns(kv, ctx.chat!.id, target.id);
 
     const config = await getConfig(kv, ctx.chat!.id);
+    const chatTitle = (ctx.chat as { title: string }).title;
 
     await ctx.reply(
       `🔄 Todos os avisos de ${mention(target)} foram zerados.\n` +
         `📊 Avisos: <b>0/${config.maxWarns}</b>`,
       { parse_mode: "HTML" }
+    );
+    await sendLog(ctx.api, kv, ctx.chat!.id, chatTitle,
+      `🔄 <b>AVISOS ZERADOS</b>\n\n` +
+      `👤 Usuário: ${ulink(target.id, target.first_name)} <code>${target.id}</code>\n` +
+      `👮 Admin: ${ulink(ctx.from!.id, ctx.from!.first_name)}`
     );
   });
 

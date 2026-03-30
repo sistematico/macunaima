@@ -1,6 +1,10 @@
 # Macunaíma — Bot Anti-Spam para Telegram
 
-Bot de moderação para grupos do Telegram que usa a IA do Google Gemini para detectar e remover mensagens de spam automaticamente. Hospedado na Cloudflare Workers (serverless, sem custo fixo).
+![Macunaíma](./assets/macunaima.jpg)
+
+> Bot de moderação para grupos do Telegram que usa a IA do Google Gemini para detectar e remover mensagens de spam automaticamente. Hospedado na Cloudflare Workers (serverless, sem custo fixo).
+
+[![Deploy](https://github.com/sistematico/macunaima/actions/workflows/deploy.yml/badge.svg)](https://github.com/sistematico/macunaima/actions/workflows/deploy.yml)
 
 ## Funcionalidades
 
@@ -260,7 +264,15 @@ macunaima/
 
 ## Comandos disponíveis
 
-Todos os comandos de moderação são exclusivos para administradores, exceto `/warns`.
+Todos os comandos de moderação são exclusivos para administradores, exceto `/warns` e `/ping`.
+
+### Geral
+
+| Comando | Descrição |
+|---|---|
+| `/ping` | Verifica se o bot está ativo e mostra a latência |
+| `/setlogchannel @canal` | Define o canal de logs para o grupo |
+| `/unsetlogchannel` | Remove o canal de logs configurado |
 
 ### Sistema de warns
 
@@ -321,6 +333,39 @@ Acesse **Settings → Secrets and variables → Actions → New repository secre
 4. **Deploy** — `wrangler deploy` autenticado com os secrets acima
 
 > **Atenção:** os secrets `BOT_TOKEN` e `GOOGLE_AI_API_KEY` do bot **não** precisam estar no GitHub — eles já estão armazenados diretamente no Cloudflare Workers via `wrangler secret put` e o deploy não os apaga.
+
+---
+
+## Canal de logs
+
+Cada grupo pode ter um canal privado onde o bot registra todas as ações de moderação.
+
+### Configurar
+
+1. Crie um canal privado no Telegram
+2. Adicione o bot ao canal e **promova-o a administrador** com permissão de publicar mensagens
+3. No grupo, execute:
+   ```
+   /setlogchannel @meucanal
+   ```
+   O bot enviará uma mensagem de confirmação no canal.
+
+### Eventos registrados
+
+| Evento | Ícone |
+|---|---|
+| Spam removido | 🗑️ |
+| Ban por spam | 🚫 |
+| Aviso aplicado | ⚠️ |
+| Punição por avisos | 🚫 |
+| Aviso removido | ✅ |
+| Avisos zerados | 🔄 |
+| Perfil removido automaticamente | 🚫 |
+| Captcha aprovado | ✅ |
+| Captcha reprovado | ❌ |
+| Captcha expirado | ⏰ |
+
+Cada entrada inclui o nome/ID do usuário, o admin responsável (quando aplicável), o grupo de origem e o horário em UTC.
 
 ---
 

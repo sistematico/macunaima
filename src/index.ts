@@ -8,6 +8,14 @@ import {
   fetchUserBio,
 } from "./profile-checker";
 import { registerWarnCommands } from "./warns";
+import {
+  getLogChannel,
+  setLogChannel,
+  removeLogChannel,
+  sendLog,
+  ulink,
+  esc,
+} from "./logger";
 
 export interface Env {
   BOT_TOKEN: string;
@@ -75,6 +83,106 @@ function createBot(env: Env): Bot {
   // ── Warn commands ─────────────────────────────────────────────────────────
   registerWarnCommands(bot, env);
 
+  // ── /ping ──────────────────────────────────────────────────────────────────
+
+  bot.command("ping", async (ctx) => {
+    const start = Date.now();
+    const msg = await ctx.reply("🏓 Pong!");
+    const elapsed = Date.now() - start;
+    await ctx.api
+      .editMessageText(
+        ctx.chat.id,
+        msg.message_id,
+        `🏓 Pong!\n⏱ <code>${elapsed}ms</code>`,
+        { parse_mode: "HTML" }
+      )
+      .catch(() => undefined);
+  });
+
+  // ── /setlogchannel ─────────────────────────────────────────────────────────
+
+  bot.command("setlogchannel", async (ctx) => {
+    if (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup") return;
+
+    const callerMember = await ctx.getChatMember(ctx.from!.id).catch(() => null);
+    if (!callerMember || !["administrator", "creator"].includes(callerMember.status)) {
+      await ctx.reply("❌ Apenas administradores podem usar este comando.");
+      return;
+    }
+
+    const text = ctx.message?.text ?? "";
+    const match = /^\/setlogchannel(?:@\S+)?\s+(\S+)/i.exec(text);
+    const input = match?.[1];
+
+    if (!input) {
+      await ctx.reply(
+        "❌ Uso: <code>/setlogchannel @canal</code> ou <code>/setlogchannel -100xxxxxxxxx</code>",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // Resolve channel ID from username or raw ID
+    let channelId: number;
+    if (/^-?\d+$/.test(input)) {
+      channelId = parseInt(input, 10);
+    } else {
+      try {
+        const chat = await ctx.api.getChat(input.startsWith("@") ? input : `@${input}`);
+        if (chat.type !== "channel") {
+          await ctx.reply("❌ O destino deve ser um canal, não um grupo.");
+          return;
+        }
+        channelId = chat.id;
+      } catch {
+        await ctx.reply(
+          "❌ Canal não encontrado. Verifique o username e se o bot é membro do canal."
+        );
+        return;
+      }
+    }
+
+    // Validate: try posting a test message to the channel
+    // ctx.chat is already narrowed to group|supergroup, both have title
+    const chatTitle = (ctx.chat as { title: string }).title;
+    try {
+      await ctx.api.sendMessage(
+        channelId,
+        `📋 <b>Canal de logs ativado!</b>\n\n` +
+          `Este canal passará a receber os registros de moderação do grupo <b>${esc(chatTitle)}</b>.`,
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      await ctx.reply(
+        "❌ Não consigo postar neste canal.\n" +
+          "Certifique-se de que o bot é <b>administrador</b> do canal com permissão de publicar mensagens.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    await setLogChannel(env.SPAM_KV, ctx.chat.id, channelId);
+    await ctx.deleteMessage().catch(() => undefined);
+    await ctx.reply("✅ Canal de logs configurado.");
+  });
+
+  // ── /unsetlogchannel ───────────────────────────────────────────────────────
+
+  bot.command("unsetlogchannel", async (ctx) => {
+    if (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup") return;
+
+    const callerMember = await ctx.getChatMember(ctx.from!.id).catch(() => null);
+    if (!callerMember || !["administrator", "creator"].includes(callerMember.status)) {
+      await ctx.reply("❌ Apenas administradores podem usar este comando.");
+      return;
+    }
+
+    const had = await getLogChannel(env.SPAM_KV, ctx.chat.id);
+    await removeLogChannel(env.SPAM_KV, ctx.chat.id);
+    await ctx.deleteMessage().catch(() => undefined);
+    await ctx.reply(had ? "✅ Canal de logs removido." : "ℹ️ Nenhum canal de logs estava configurado.");
+  });
+
   // ── New member: profile check + captcha ───────────────────────────────────
 
   bot.on("message:new_chat_members", async (ctx) => {
@@ -114,11 +222,19 @@ function createBot(env: Env): Bot {
         } catch {
           // no permission
         }
-        const reason = photoResult.flagged ? photoResult.reason : textResult.reason;
+        const flagReason = photoResult.flagged ? photoResult.reason : textResult.reason;
+        const flagConf = photoResult.flagged ? photoResult.confidence : textResult.confidence;
+        const chatTitle = (ctx.chat as { title: string }).title;
         await ctx.reply(
           `🚫 <a href="tg://user?id=${member.id}">${member.first_name}</a> foi removido automaticamente.\n` +
-            `Motivo: <i>${reason}</i>`,
+            `Motivo: <i>${flagReason}</i>`,
           { parse_mode: "HTML" }
+        );
+        await sendLog(ctx.api, env.SPAM_KV, ctx.chat.id, chatTitle,
+          `🚫 <b>PERFIL REMOVIDO AUTOMATICAMENTE</b>\n\n` +
+          `👤 Usuário: ${ulink(member.id, member.first_name)} <code>${member.id}</code>\n` +
+          `📝 Motivo: <i>${esc(flagReason)}</i>\n` +
+          `📊 Confiança: <b>${Math.round(flagConf * 100)}%</b>`
         );
         continue;
       }
@@ -184,12 +300,18 @@ function createBot(env: Env): Bot {
     await env.SPAM_KV.delete(key);
     await ctx.deleteMessage().catch(() => undefined);
 
+    // chat could be any type in a callback query — use safe access
+    const chatTitle = (chat as { title?: string }).title ?? String(chat.id);
+
     if (answer === data.correct) {
       await ctx.answerCallbackQuery({ text: "✅ Correto! Bem-vindo(a)!" });
+      await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+        `✅ <b>CAPTCHA APROVADO</b>\n\n` +
+        `👤 Usuário: ${ulink(targetUserId, data.firstName)} <code>${targetUserId}</code>`
+      );
     } else {
       await ctx.answerCallbackQuery({ text: "❌ Resposta incorreta." });
       try {
-        // ban + immediate unban = kick (user can rejoin)
         await ctx.api.banChatMember(chat.id, targetUserId);
         await ctx.api.unbanChatMember(chat.id, targetUserId);
       } catch {
@@ -199,6 +321,11 @@ function createBot(env: Env): Bot {
         `❌ <a href="tg://user?id=${targetUserId}">${data.firstName}</a> ` +
           `foi removido por responder incorretamente ao captcha.`,
         { parse_mode: "HTML" }
+      );
+      await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+        `❌ <b>CAPTCHA REPROVADO</b>\n\n` +
+        `👤 Usuário: ${ulink(targetUserId, data.firstName)} <code>${targetUserId}</code>\n` +
+        `📝 Motivo: resposta incorreta`
       );
     }
   });
@@ -248,26 +375,42 @@ function createBot(env: Env): Bot {
     }
 
     const warnings = await incrementWarnings(env.SPAM_KV, chat.id, from.id);
-    const mention = from.username
+    // chat is already narrowed to group|supergroup above
+    const chatTitle = (chat as { title: string }).title;
+    const userMention = from.username
       ? `@${from.username}`
       : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
+
+    // Log the deleted spam message
+    await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+      `🗑️ <b>SPAM REMOVIDO</b>\n\n` +
+      `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+      `📋 Categoria: <i>${esc(analysis.category)}</i>\n` +
+      `📊 Confiança: <b>${Math.round(analysis.confidence * 100)}%</b>  Aviso: <b>${warnings}/${maxWarnings}</b>\n` +
+      `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+    );
 
     if (warnings >= maxWarnings) {
       try {
         await ctx.banChatMember(from.id);
-        await ctx.reply(`🚫 ${mention} foi banido por spam repetido.`, {
+        await ctx.reply(`🚫 ${userMention} foi banido por spam repetido.`, {
           parse_mode: "HTML",
         });
+        await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+          `🚫 <b>BAN POR SPAM</b>\n\n` +
+          `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+          `📊 Avisos de spam atingidos: <b>${warnings}/${maxWarnings}</b>`
+        );
       } catch {
         await ctx.reply(
-          `⛔ ${mention} atingiu o limite de avisos (${maxWarnings}/${maxWarnings}). ` +
+          `⛔ ${userMention} atingiu o limite de avisos (${maxWarnings}/${maxWarnings}). ` +
             `Não tenho permissão para banir — por favor, remova manualmente.`,
           { parse_mode: "HTML" }
         );
       }
     } else {
       await ctx.reply(
-        `⚠️ Mensagem de ${mention} removida por spam.\n` +
+        `⚠️ Mensagem de ${userMention} removida por spam.\n` +
           `📋 Categoria: <i>${analysis.category}</i>\n` +
           `📊 Aviso ${warnings}/${maxWarnings}`,
         { parse_mode: "HTML" }
@@ -309,6 +452,11 @@ export default {
             `⏰ <a href="tg://user?id=${data.userId}">${data.firstName}</a> ` +
               `foi removido por não responder ao captcha a tempo.`,
             { parse_mode: "HTML" }
+          );
+          await sendLog(bot.api, env.SPAM_KV, data.chatId, String(data.chatId),
+            `⏰ <b>CAPTCHA EXPIRADO</b>\n\n` +
+            `👤 Usuário: ${ulink(data.userId, data.firstName)} <code>${data.userId}</code>\n` +
+            `📝 Não respondeu ao captcha dentro do prazo`
           );
         } catch (err) {
           console.error(`Failed to kick user ${data.userId}:`, err);
