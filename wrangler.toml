@@ -4,7 +4,7 @@ compatibility_date = "2025-03-01"
 
 [vars]
 # Confidence threshold (0.0 – 1.0) above which a message is deleted
-SPAM_THRESHOLD = "0.80"
+SPAM_THRESHOLD = "0.50"
 # Number of spam warnings before the user is banned
 MAX_WARNINGS = "3"
 # Gemini model to use for spam analysis
@@ -26,3 +26,18 @@ crons = ["* * * * *"]
 binding = "SPAM_KV"
 id = "5755c0ea91e34f7dba1cee29d7cdadd5"
 preview_id = "59e7efa296f84f44acccb1df8e4ac1a1"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
