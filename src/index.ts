@@ -20,6 +20,9 @@ import {
   getLogChannel,
   setLogChannel,
   removeLogChannel,
+  getGlobalLogChannel,
+  setGlobalLogChannel,
+  removeGlobalLogChannel,
   sendLog,
   ulink,
   esc,
@@ -78,6 +81,34 @@ function extractLinks(text: string, entities: MessageEntity[]): string[] {
   return links;
 }
 
+// ── Channel resolution helper ─────────────────────────────────────────────────
+//
+// Accepts either:
+//   @username  — public channel  (resolved via getChat)
+//   -100xxx    — private channel (numeric ID used directly)
+
+async function resolveChannelId(
+  api: import("grammy").Api,
+  input: string
+): Promise<{ id: number } | { error: string }> {
+  if (/^-?\d+$/.test(input)) {
+    return { id: parseInt(input, 10) };
+  }
+  try {
+    const chat = await api.getChat(input.startsWith("@") ? input : `@${input}`);
+    if (chat.type !== "channel") return { error: "O destino deve ser um canal, não um grupo." };
+    return { id: chat.id };
+  } catch {
+    return {
+      error:
+        "Canal não encontrado.\n" +
+        "• Para canais <b>públicos</b>: use <code>@username</code>\n" +
+        "• Para canais <b>privados</b>: use o ID numérico (<code>-100xxxxxxxxx</code>)\n" +
+        "Verifique também se o bot é membro do canal.",
+    };
+  }
+}
+
 // ── Bot factory ────────────────────────────────────────────────────────────────
 
 function createBot(env: Env): Bot {
@@ -128,38 +159,24 @@ function createBot(env: Env): Bot {
 
     if (!input) {
       await ctx.reply(
-        "❌ Uso: <code>/setlogchannel @canal</code> ou <code>/setlogchannel -100xxxxxxxxx</code>",
+        "❌ Uso:\n" +
+          "• <code>/setlogchannel @canal</code> — canal público\n" +
+          "• <code>/setlogchannel -100xxxxxxxxx</code> — canal privado (ID numérico)",
         { parse_mode: "HTML" }
       );
       return;
     }
 
-    // Resolve channel ID from username or raw ID
-    let channelId: number;
-    if (/^-?\d+$/.test(input)) {
-      channelId = parseInt(input, 10);
-    } else {
-      try {
-        const chat = await ctx.api.getChat(input.startsWith("@") ? input : `@${input}`);
-        if (chat.type !== "channel") {
-          await ctx.reply("❌ O destino deve ser um canal, não um grupo.");
-          return;
-        }
-        channelId = chat.id;
-      } catch {
-        await ctx.reply(
-          "❌ Canal não encontrado. Verifique o username e se o bot é membro do canal."
-        );
-        return;
-      }
+    const resolved = await resolveChannelId(ctx.api, input);
+    if ("error" in resolved) {
+      await ctx.reply(`❌ ${resolved.error}`, { parse_mode: "HTML" });
+      return;
     }
 
-    // Validate: try posting a test message to the channel
-    // ctx.chat is already narrowed to group|supergroup, both have title
     const chatTitle = (ctx.chat as { title: string }).title;
     try {
       await ctx.api.sendMessage(
-        channelId,
+        resolved.id,
         `📋 <b>Canal de logs ativado!</b>\n\n` +
           `Este canal passará a receber os registros de moderação do grupo <b>${esc(chatTitle)}</b>.`,
         { parse_mode: "HTML" }
@@ -173,9 +190,9 @@ function createBot(env: Env): Bot {
       return;
     }
 
-    await setLogChannel(env.SPAM_KV, ctx.chat.id, channelId);
+    await setLogChannel(env.SPAM_KV, ctx.chat.id, resolved.id);
     await ctx.deleteMessage().catch(() => undefined);
-    await ctx.reply("✅ Canal de logs configurado.");
+    await ctx.reply("✅ Canal de logs do grupo configurado.");
   });
 
   // ── /unsetlogchannel ───────────────────────────────────────────────────────
@@ -192,7 +209,75 @@ function createBot(env: Env): Bot {
     const had = await getLogChannel(env.SPAM_KV, ctx.chat.id);
     await removeLogChannel(env.SPAM_KV, ctx.chat.id);
     await ctx.deleteMessage().catch(() => undefined);
-    await ctx.reply(had ? "✅ Canal de logs removido." : "ℹ️ Nenhum canal de logs estava configurado.");
+    await ctx.reply(had ? "✅ Canal de logs do grupo removido." : "ℹ️ Nenhum canal de logs estava configurado.");
+  });
+
+  // ── /setgloballog ──────────────────────────────────────────────────────────
+  //
+  // Configures the bot-wide log channel that receives events from ALL groups.
+  // Only works in private chat (DM) with the bot to prevent misuse.
+
+  bot.command("setgloballog", async (ctx) => {
+    if (ctx.chat.type !== "private") {
+      await ctx.reply(
+        "ℹ️ Este comando só pode ser usado em conversa privada com o bot.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const text = ctx.message?.text ?? "";
+    const match = /^\/setgloballog(?:@\S+)?\s+(\S+)/i.exec(text);
+    const input = match?.[1];
+
+    if (!input) {
+      await ctx.reply(
+        "❌ Uso:\n" +
+          "• <code>/setgloballog @canal</code> — canal público\n" +
+          "• <code>/setgloballog -100xxxxxxxxx</code> — canal privado (ID numérico)\n\n" +
+          "O canal global recebe eventos de <b>todos</b> os grupos onde o bot está.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const resolved = await resolveChannelId(ctx.api, input);
+    if ("error" in resolved) {
+      await ctx.reply(`❌ ${resolved.error}`, { parse_mode: "HTML" });
+      return;
+    }
+
+    try {
+      await ctx.api.sendMessage(
+        resolved.id,
+        `🌐 <b>Canal de logs global ativado!</b>\n\n` +
+          `Este canal passará a receber os registros de moderação de <b>todos os grupos</b> onde o bot está presente.`,
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      await ctx.reply(
+        "❌ Não consigo postar neste canal.\n" +
+          "Certifique-se de que o bot é <b>administrador</b> do canal com permissão de publicar mensagens.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    await setGlobalLogChannel(env.SPAM_KV, resolved.id);
+    await ctx.reply("✅ Canal de logs global configurado.");
+  });
+
+  // ── /unsetgloballog ────────────────────────────────────────────────────────
+
+  bot.command("unsetgloballog", async (ctx) => {
+    if (ctx.chat.type !== "private") {
+      await ctx.reply("ℹ️ Este comando só pode ser usado em conversa privada com o bot.");
+      return;
+    }
+
+    const had = await getGlobalLogChannel(env.SPAM_KV);
+    await removeGlobalLogChannel(env.SPAM_KV);
+    await ctx.reply(had ? "✅ Canal de logs global removido." : "ℹ️ Nenhum canal de logs global estava configurado.");
   });
 
   // ── New member: profile check + captcha ───────────────────────────────────
@@ -350,13 +435,13 @@ function createBot(env: Env): Bot {
     if (chat.type !== "group" && chat.type !== "supergroup") return;
     if (!from || from.is_bot) return;
 
+    const text = message.text ?? message.caption ?? "";
+    if (text.length < 8) return;
+
     try {
       const member = await ctx.getChatMember(from.id);
       if (member.status === "administrator" || member.status === "creator") return;
     } catch { /* proceed */ }
-
-    const text = message.text ?? message.caption ?? "";
-    if (text.length < 8) return;
 
     // Skip if this user was already checked recently
     if (await isThrottled(env.SPAM_KV, chat.id, from.id)) return;

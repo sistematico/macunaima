@@ -16,11 +16,11 @@ PROFILE_CHECK_THRESHOLD = "0.80"
 # Confidence threshold for offensive content auto-warn (higher = fewer false positives)
 OFFENSIVE_THRESHOLD = "0.90"
 # Seconds a user is "throttled" after a Gemini check (limits API usage)
-GEMINI_THROTTLE_SECONDS = "60"
+GEMINI_THROTTLE_SECONDS = "180"
 
 [triggers]
 # Checks every minute for members who did not answer the captcha in time
-crons = ["* * * * *"]
+crons = ["*/5 * * * *"]
 
 # Secrets (set via `wrangler secret put`):
 #   BOT_TOKEN        – Telegram bot token from @BotFather

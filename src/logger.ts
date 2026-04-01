@@ -3,6 +3,7 @@ import type { Api } from "grammy";
 // ── KV helpers ────────────────────────────────────────────────────────────────
 
 const LOG_KEY = (chatId: number) => `log_channel:${chatId}`;
+const GLOBAL_LOG_KEY = "global_log_channel";
 
 export async function getLogChannel(
   kv: KVNamespace,
@@ -27,6 +28,26 @@ export async function removeLogChannel(
   await kv.delete(LOG_KEY(chatId));
 }
 
+export async function getGlobalLogChannel(
+  kv: KVNamespace
+): Promise<number | null> {
+  const val = await kv.get(GLOBAL_LOG_KEY);
+  return val ? parseInt(val, 10) : null;
+}
+
+export async function setGlobalLogChannel(
+  kv: KVNamespace,
+  channelId: number
+): Promise<void> {
+  await kv.put(GLOBAL_LOG_KEY, String(channelId));
+}
+
+export async function removeGlobalLogChannel(
+  kv: KVNamespace
+): Promise<void> {
+  await kv.delete(GLOBAL_LOG_KEY);
+}
+
 // ── Formatting ─────────────────────────────────────────────────────────────────
 
 export function esc(text: string): string {
@@ -44,8 +65,11 @@ function utcNow(): string {
 // ── Sender ─────────────────────────────────────────────────────────────────────
 
 /**
- * Sends a moderation log entry to the configured log channel for `chatId`.
- * Silently does nothing if no channel is configured.
+ * Sends a moderation log entry to:
+ *   1. The per-group log channel configured for `chatId` (if any).
+ *   2. The global log channel (if any), provided it differs from the group channel.
+ *
+ * Both sends happen in parallel — no additional worker invocation is created.
  */
 export async function sendLog(
   api: Api,
@@ -54,8 +78,12 @@ export async function sendLog(
   chatTitle: string,
   body: string
 ): Promise<void> {
-  const channelId = await getLogChannel(kv, chatId);
-  if (!channelId) return;
+  const [groupChannelId, globalChannelId] = await Promise.all([
+    getLogChannel(kv, chatId),
+    getGlobalLogChannel(kv),
+  ]);
+
+  if (!groupChannelId && !globalChannelId) return;
 
   const message =
     body +
@@ -63,9 +91,24 @@ export async function sendLog(
     `🏠 <b>${esc(chatTitle)}</b>\n` +
     `🆔 <code>${chatId}</code>  🕐 <code>${utcNow()}</code>`;
 
-  try {
-    await api.sendMessage(channelId, message, { parse_mode: "HTML" });
-  } catch (err) {
-    console.error(`[logger] channel ${channelId}: ${String(err)}`);
+  const sends: Promise<unknown>[] = [];
+
+  if (groupChannelId) {
+    sends.push(
+      api
+        .sendMessage(groupChannelId, message, { parse_mode: "HTML" })
+        .catch((err) => console.error(`[logger] group channel ${groupChannelId}: ${String(err)}`))
+    );
   }
+
+  // Only send to global if it's a different channel (avoid duplicate messages)
+  if (globalChannelId && globalChannelId !== groupChannelId) {
+    sends.push(
+      api
+        .sendMessage(globalChannelId, message, { parse_mode: "HTML" })
+        .catch((err) => console.error(`[logger] global channel ${globalChannelId}: ${String(err)}`))
+    );
+  }
+
+  await Promise.all(sends);
 }
