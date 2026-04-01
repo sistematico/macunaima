@@ -567,6 +567,9 @@ function createBot(env: Env): Bot {
 export default {
   // Webhook: called by Telegram on every update
   async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.method !== "POST") {
+      return new Response("OK", { status: 200 });
+    }
     const bot = createBot(env);
     return webhookCallback(bot, "cloudflare-mod")(request);
   },
