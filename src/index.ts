@@ -15,6 +15,7 @@ import {
   clearWarns,
   applyPunishment,
   PUNISHMENT_LABEL,
+  ANTI_PROMOTION_ACTION_LABEL,
 } from "./warns";
 import {
   getLogChannel,
@@ -79,6 +80,34 @@ function extractLinks(text: string, entities: MessageEntity[]): string[] {
     }
   }
   return links;
+}
+
+// ── Telegram link detection ──────────────────────────────────────────────────
+
+const TELEGRAM_LINK_RE =
+  /(?:https?:\/\/)?(?:t\.me|telegram\.me|telegram\.dog)\/\S+/i;
+
+/**
+ * Returns true if the message contains links to other Telegram groups or
+ * channels (invite links, public group/channel links, etc.).
+ */
+function containsTelegramPromotion(
+  text: string,
+  entities: MessageEntity[]
+): boolean {
+  // Check URL entities
+  for (const entity of entities) {
+    if (entity.type === "url") {
+      const url = text.slice(entity.offset, entity.offset + entity.length);
+      if (TELEGRAM_LINK_RE.test(url)) return true;
+    }
+    if (entity.type === "text_link" && entity.url) {
+      if (TELEGRAM_LINK_RE.test(entity.url)) return true;
+    }
+  }
+  // Check raw text as fallback (obfuscated links without entity)
+  if (TELEGRAM_LINK_RE.test(text)) return true;
+  return false;
 }
 
 // ── Channel resolution helper ─────────────────────────────────────────────────
@@ -443,10 +472,105 @@ function createBot(env: Env): Bot {
       if (member.status === "administrator" || member.status === "creator") return;
     } catch { /* proceed */ }
 
-    // Skip if this user was already checked recently
+    const entities = message.entities ?? message.caption_entities ?? [];
+
+    // ── Anti-promotion check (before Gemini, no API cost) ──────────────────
+
+    if (containsTelegramPromotion(text, entities)) {
+      const groupConfig = await getConfig(env.SPAM_KV, chat.id);
+      if (groupConfig.antiPromotion) {
+        const chatTitle = (chat as { title: string }).title;
+        const userMention = from.username
+          ? `@${from.username}`
+          : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
+
+        try { await ctx.deleteMessage(); } catch { /* no permission */ }
+
+        const action = groupConfig.antiPromotionAction;
+
+        if (action === "warn") {
+          const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id);
+
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO BLOQUEADA</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `📊 Avisos: <b>${warnCount}/${groupConfig.maxWarns}</b>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+
+          if (warnCount >= groupConfig.maxWarns) {
+            try {
+              await applyPunishment(ctx.api, chat.id, from.id, groupConfig.punishment);
+              await clearWarns(env.SPAM_KV, chat.id, from.id);
+              await ctx.reply(
+                `🚫 ${userMention} atingiu <b>${warnCount}/${groupConfig.maxWarns}</b> avisos.\n` +
+                  `Punição: <b>${PUNISHMENT_LABEL[groupConfig.punishment]}</b>\n` +
+                  `📝 Motivo: <i>divulgação de grupo/canal</i>`,
+                { parse_mode: "HTML" }
+              );
+            } catch {
+              await ctx.reply(
+                `⛔ ${userMention} atingiu o limite de avisos. Não tenho permissão para aplicar a punição.`,
+                { parse_mode: "HTML" }
+              );
+            }
+          } else {
+            await ctx.reply(
+              `⚠️ ${userMention} recebeu um aviso por divulgação de grupo/canal.\n` +
+                `📊 Avisos: <b>${warnCount}/${groupConfig.maxWarns}</b>`,
+              { parse_mode: "HTML" }
+            );
+          }
+        } else if (action === "ban") {
+          try {
+            await ctx.api.banChatMember(chat.id, from.id);
+            await ctx.reply(
+              `🚫 ${userMention} foi banido por divulgação de grupo/canal.`,
+              { parse_mode: "HTML" }
+            );
+          } catch {
+            await ctx.reply(
+              `⛔ Não tenho permissão para banir ${userMention}.`,
+              { parse_mode: "HTML" }
+            );
+          }
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO — BAN</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+        } else if (action === "kick") {
+          try {
+            await ctx.api.banChatMember(chat.id, from.id);
+            await ctx.api.unbanChatMember(chat.id, from.id);
+            await ctx.reply(
+              `🚫 ${userMention} foi removido por divulgação de grupo/canal.`,
+              { parse_mode: "HTML" }
+            );
+          } catch {
+            await ctx.reply(
+              `⛔ Não tenho permissão para remover ${userMention}.`,
+              { parse_mode: "HTML" }
+            );
+          }
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO — KICK</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+        } else {
+          // action === "delete" — message already deleted above
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO APAGADA</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+        }
+        return; // Stop processing — no need for Gemini analysis
+      }
+    }
     if (await isThrottled(env.SPAM_KV, chat.id, from.id)) return;
 
-    const entities = message.entities ?? message.caption_entities ?? [];
     const links = extractLinks(text, entities);
 
     let analysis: Awaited<ReturnType<typeof analyzeContent>>;

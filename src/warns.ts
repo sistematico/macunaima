@@ -6,18 +6,25 @@ import { sendLog, ulink, esc } from "./logger";
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 export type Punishment = "ban" | "kick" | "mute";
+export type AntiPromotionAction = "warn" | "ban" | "kick" | "delete";
 
 export interface GroupConfig {
   maxWarns: number;
   punishment: Punishment;
   /** Whether the bot should auto-warn for offensive content (default: true) */
   offensiveDetection: boolean;
+  /** Whether the bot should block promotion of other groups/channels (default: true) */
+  antiPromotion: boolean;
+  /** Action to take when promotion is detected (default: "warn") */
+  antiPromotionAction: AntiPromotionAction;
 }
 
 const DEFAULT_CONFIG: GroupConfig = {
   maxWarns: 3,
   punishment: "ban",
   offensiveDetection: true,
+  antiPromotion: true,
+  antiPromotionAction: "warn",
 };
 
 // ── KV helpers ─────────────────────────────────────────────────────────────────
@@ -91,6 +98,13 @@ export const PUNISHMENT_LABEL: Record<Punishment, string> = {
   ban: "banido permanentemente",
   kick: "removido do grupo",
   mute: "silenciado permanentemente",
+};
+
+export const ANTI_PROMOTION_ACTION_LABEL: Record<AntiPromotionAction, string> = {
+  warn: "apagar + avisar",
+  ban: "apagar + banir",
+  kick: "apagar + expulsar",
+  delete: "somente apagar",
 };
 
 function mention(user: User): string {
@@ -462,6 +476,72 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
       enabled
         ? "✅ Detecção de conteúdo ofensivo <b>ativada</b>."
         : "✅ Detecção de conteúdo ofensivo <b>desativada</b>.",
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ── /setantipromotion ─────────────────────────────────────────────────────
+
+  bot.command("setantipromotion", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const text = ctx.message?.text ?? "";
+    const match = /^\/setantipromotion(?:@\S+)?\s+(on|off)/i.exec(text);
+    const value = match?.[1]?.toLowerCase();
+
+    if (!value) {
+      const config = await getConfig(kv, ctx.chat!.id);
+      await ctx.reply(
+        "❌ Uso: <code>/setantipromotion &lt;on|off&gt;</code>\n\n" +
+          "• <b>on</b> — bloqueia divulgação de outros grupos/canais\n" +
+          "• <b>off</b> — permite links de grupos/canais\n\n" +
+          `Status atual: <b>${config.antiPromotion ? "ativado" : "desativado"}</b>\n` +
+          `Ação atual: <b>${ANTI_PROMOTION_ACTION_LABEL[config.antiPromotionAction]}</b>`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const enabled = value === "on";
+    await saveConfig(kv, ctx.chat!.id, { antiPromotion: enabled });
+    await ctx.deleteMessage().catch(() => undefined);
+    await ctx.reply(
+      enabled
+        ? "✅ Anti-divulgação <b>ativada</b>. Links de grupos/canais serão bloqueados."
+        : "✅ Anti-divulgação <b>desativada</b>. Links de grupos/canais não serão bloqueados.",
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ── /setpromotionaction ───────────────────────────────────────────────────
+
+  bot.command("setpromotionaction", async (ctx) => {
+    if (!await groupOnly(ctx)) return;
+    if (!await requireAdmin(ctx)) return;
+
+    const text = ctx.message?.text ?? "";
+    const match = /^\/setpromotionaction(?:@\S+)?\s+(warn|ban|kick|delete)/i.exec(text);
+    const action = match?.[1]?.toLowerCase() as AntiPromotionAction | undefined;
+
+    if (!action) {
+      const config = await getConfig(kv, ctx.chat!.id);
+      await ctx.reply(
+        "❌ Uso: <code>/setpromotionaction &lt;warn|ban|kick|delete&gt;</code>\n\n" +
+          "• <b>warn</b> — apaga a mensagem e aplica um aviso (padrão)\n" +
+          "• <b>ban</b> — apaga a mensagem e bane o usuário\n" +
+          "• <b>kick</b> — apaga a mensagem e expulsa o usuário\n" +
+          "• <b>delete</b> — somente apaga a mensagem\n\n" +
+          `Ação atual: <b>${ANTI_PROMOTION_ACTION_LABEL[config.antiPromotionAction]}</b>`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const config = await saveConfig(kv, ctx.chat!.id, { antiPromotionAction: action });
+    await ctx.deleteMessage().catch(() => undefined);
+    await ctx.reply(
+      `✅ Ação anti-divulgação definida: <b>${ANTI_PROMOTION_ACTION_LABEL[config.antiPromotionAction]}</b>`,
       { parse_mode: "HTML" }
     );
   });
