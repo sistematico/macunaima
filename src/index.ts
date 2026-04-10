@@ -155,7 +155,13 @@ function extractLinks(text: string, entities: MessageEntity[]): string[] {
       links.push(entity.url);
     }
   }
-  return links;
+
+  const rawUrlPattern = /(?:https?:\/\/[^\s]+|(?:t\.me|telegram\.me|telegram\.dog)\/[^\s]+)/gi;
+  for (const match of text.matchAll(rawUrlPattern)) {
+    if (match[0]) links.push(match[0]);
+  }
+
+  return Array.from(new Set(links));
 }
 
 // ── Telegram link detection ──────────────────────────────────────────────────
@@ -834,14 +840,17 @@ function createBot(env: Env): Bot {
     if (!from || from.is_bot) return;
 
     const text = message.text ?? message.caption ?? "";
-    if (text.length < 8) return;
+    const entities = message.entities ?? message.caption_entities ?? [];
+    const links = extractLinks(text, entities);
+    const compactText = text.replace(/\s+/g, "").trim();
+
+    // Skip only truly empty/noise messages. Short text can still be spam (BET, golpe, links).
+    if (compactText.length < 3 && links.length === 0) return;
 
     try {
       const member = await ctx.getChatMember(from.id);
       if (member.status === "administrator" || member.status === "creator") return;
     } catch { /* proceed */ }
-
-    const entities = message.entities ?? message.caption_entities ?? [];
 
     // ── Anti-promotion check (before Gemini, no API cost) ──────────────────
 
@@ -946,8 +955,6 @@ function createBot(env: Env): Bot {
       geminiMaxCallsPerMinute
     );
     if (!geminiSlot) return;
-
-    const links = extractLinks(text, entities);
 
     let analysis: Awaited<ReturnType<typeof analyzeContent>>;
     try {

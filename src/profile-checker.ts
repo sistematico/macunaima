@@ -7,6 +7,40 @@ export interface ProfileCheckResult {
   reason: string;
 }
 
+function clamp01(value: unknown): number {
+  const n = typeof value === "number" ? value : parseFloat(String(value ?? "0"));
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(1, Math.max(0, n));
+}
+
+function parseProfileResult(raw: string): ProfileCheckResult | null {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  const parseCandidate = (value: string): ProfileCheckResult | null => {
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown>;
+      return {
+        flagged: Boolean(parsed.flagged),
+        confidence: clamp01(parsed.confidence),
+        reason: String(parsed.reason ?? "Classificação automática"),
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = parseCandidate(cleaned);
+  if (direct) return direct;
+
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  return parseCandidate(match[0]);
+}
+
 // ── Telegram helpers ───────────────────────────────────────────────────────────
 
 interface TelegramResponse<T> {
@@ -129,13 +163,19 @@ export async function checkProfilePhoto(
     ])
   );
 
-  return JSON.parse(result.response.text()) as ProfileCheckResult;
+  return (
+    parseProfileResult(result.response.text()) ?? {
+      flagged: false,
+      confidence: 0,
+      reason: "Resposta inválida do modelo",
+    }
+  );
 }
 
 // ── Profile text check (name + username + bio) ────────────────────────────────
 
 const ADULT_NAME_PATTERN =
-  /onlyfans|privacy\.com|adult|xxx|nsfw|escort|acompanhante|gp\b|garota\s*de\s*programa|privacy|pack\s*vip|conteúdo\s*adulto/i;
+  /onlyfans|privacy\.com|privacy|adult|xxx|nsfw|escort|acompanhante|gp\b|garota\s*de\s*programa|pack\s*vip|conte[úu]do\s*adulto|nude|sexo|er[oó]tico|massagem\s*sensual|camgirl/i;
 
 const TEXT_PROMPT = `Analyze this Telegram profile and determine if it belongs to an account that promotes adult content, sexual services, prostitution, escort services, or explicit content sales.
 
@@ -166,11 +206,11 @@ export async function checkProfileText(
 ): Promise<ProfileCheckResult> {
   // Fast path: regex check on name/username before hitting the API
   const combined = [firstName, username ?? "", bio ?? ""].join(" ");
-  if (!bio && ADULT_NAME_PATTERN.test(combined)) {
+  if (ADULT_NAME_PATTERN.test(combined)) {
     return {
       flagged: true,
       confidence: 0.92,
-      reason: "Nome ou username com padrão de conteúdo adulto",
+      reason: "Perfil com padrão de conteúdo adulto/erótico",
     };
   }
 
@@ -199,7 +239,13 @@ export async function checkProfileText(
     )
   );
 
-  return JSON.parse(result.response.text()) as ProfileCheckResult;
+  return (
+    parseProfileResult(result.response.text()) ?? {
+      flagged: false,
+      confidence: 0,
+      reason: "Resposta inválida do modelo",
+    }
+  );
 }
 
 // ── Bio fetcher ───────────────────────────────────────────────────────────────
