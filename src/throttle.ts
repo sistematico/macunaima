@@ -12,6 +12,12 @@
 const KEY = (chatId: number, userId: number) =>
   `gemini_throttle:${chatId}:${userId}`;
 
+const MIN_KV_TTL_SECONDS = 60;
+
+function normalizeKvTtl(seconds: number): number {
+  return Math.max(MIN_KV_TTL_SECONDS, Math.ceil(seconds));
+}
+
 export async function isThrottled(
   kv: KVNamespace,
   chatId: number,
@@ -26,7 +32,9 @@ export async function setThrottle(
   userId: number,
   ttlSeconds: number
 ): Promise<void> {
-  await kv.put(KEY(chatId, userId), "1", { expirationTtl: ttlSeconds });
+  await kv.put(KEY(chatId, userId), "1", {
+    expirationTtl: normalizeKvTtl(ttlSeconds),
+  });
 }
 
 const WINDOW_KEY = (scope: string, bucket: number) =>
@@ -50,7 +58,7 @@ export async function allowFixedWindow(
   if (current >= limit) return false;
 
   await kv.put(key, String(current + 1), {
-    expirationTtl: windowSeconds + 5,
+    expirationTtl: normalizeKvTtl(windowSeconds + 5),
   });
   return true;
 }
