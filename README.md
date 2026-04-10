@@ -11,6 +11,9 @@
 - **Sistema de warns** com configuração por grupo (limite, punição) e comandos completos de gestão
 - **Verificação de perfil:** ao entrar, a foto de perfil e a bio são analisadas pelo Gemini; perfis com conteúdo adulto/sexual são removidos antes mesmo do captcha
 - **Captcha de boas-vindas:** novo membro recebe um desafio matemático via botão inline; sem resposta em N minutos é removido automaticamente
+- **Pós-captcha opcional:** ao acertar o captcha, o bot pode enviar botão com as regras do grupo (link configurável por grupo)
+- **Painel de configuração no privado:** use `/config` no grupo para salvar contexto e ajustar opções com botões no chat privado
+- **Higiene de comandos:** opção por grupo para apagar comandos enviados por não-admin (desativada por padrão)
 - Analisa cada mensagem de membros comuns com o Gemini AI
 - Remove automaticamente mensagens identificadas como spam
 - Sistema de avisos por usuário (persistido no Cloudflare KV)
@@ -110,6 +113,7 @@ Edite o `wrangler.toml` para ajustar os parâmetros do bot:
 | `PROFILE_CHECK_THRESHOLD` | `0.85` | Confiança mínima para remoção por perfil com conteúdo adulto |
 | `OFFENSIVE_THRESHOLD` | `0.90` | Confiança mínima para auto-warn por conteúdo ofensivo (alto para evitar falsos positivos) |
 | `GEMINI_THROTTLE_SECONDS` | `60` | Segundos de cooldown por usuário entre chamadas ao Gemini |
+| `GEMINI_MAX_CALLS_PER_MINUTE` | `12` | Limite de análises Gemini por grupo/minuto (proteção extra para plano gratuito) |
 
 ---
 
@@ -276,6 +280,7 @@ Todos os comandos de moderação são exclusivos para administradores, exceto `/
 | `/setlogchannel @canal` | Define o canal de logs para o grupo |
 | `/unsetlogchannel` | Remove o canal de logs configurado |
 | `/setoffensive on\|off` | Ativa ou desativa detecção de conteúdo ofensivo no grupo |
+| `/config` no grupo | Apaga o comando e salva contexto do grupo para abrir painel no privado |
 
 ### Sistema de warns
 

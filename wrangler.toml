@@ -17,6 +17,8 @@ PROFILE_CHECK_THRESHOLD = "0.80"
 OFFENSIVE_THRESHOLD = "0.90"
 # Seconds a user is "throttled" after a Gemini check (limits API usage)
 GEMINI_THROTTLE_SECONDS = "180"
+# Max Gemini analyses per group per minute (extra free-tier protection)
+GEMINI_MAX_CALLS_PER_MINUTE = "12"
 
 [triggers]
 # Checks every minute for members who did not answer the captcha in time

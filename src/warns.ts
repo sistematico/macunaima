@@ -17,6 +17,10 @@ export interface GroupConfig {
   antiPromotion: boolean;
   /** Action to take when promotion is detected (default: "warn") */
   antiPromotionAction: AntiPromotionAction;
+  /** Optional URL for group rules button shown after captcha approval */
+  rulesUrl: string | null;
+  /** Whether non-admin commands should be deleted in group chats */
+  deleteNonAdminCommands: boolean;
 }
 
 const DEFAULT_CONFIG: GroupConfig = {
@@ -25,6 +29,8 @@ const DEFAULT_CONFIG: GroupConfig = {
   offensiveDetection: true,
   antiPromotion: true,
   antiPromotionAction: "warn",
+  rulesUrl: null,
+  deleteNonAdminCommands: false,
 };
 
 // ── KV helpers ─────────────────────────────────────────────────────────────────
@@ -33,7 +39,7 @@ const warnKey = (chatId: number, userId: number) =>
   `warns:${chatId}:${userId}`;
 const configKey = (chatId: number) => `group_config:${chatId}`;
 
-async function saveConfig(
+export async function saveConfig(
   kv: KVNamespace,
   chatId: number,
   patch: Partial<GroupConfig>

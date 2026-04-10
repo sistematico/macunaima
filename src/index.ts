@@ -1,7 +1,12 @@
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import type { MessageEntity } from "grammy/types";
 import { analyzeContent } from "./spam-detector";
-import { isThrottled, setThrottle } from "./throttle";
+import {
+  allowFixedWindow,
+  isThrottled,
+  reserveGeminiChatSlot,
+  setThrottle,
+} from "./throttle";
 import { captchaKey, generateCaptcha, type CaptchaData } from "./captcha";
 import {
   checkProfilePhoto,
@@ -11,11 +16,13 @@ import {
 import {
   registerWarnCommands,
   getConfig,
+  saveConfig,
   addWarn,
   clearWarns,
   applyPunishment,
   PUNISHMENT_LABEL,
   ANTI_PROMOTION_ACTION_LABEL,
+  type GroupConfig,
 } from "./warns";
 import {
   getLogChannel,
@@ -39,7 +46,76 @@ export interface Env {
   PROFILE_CHECK_THRESHOLD: string;
   OFFENSIVE_THRESHOLD: string;
   GEMINI_THROTTLE_SECONDS: string;
+  GEMINI_MAX_CALLS_PER_MINUTE: string;
   SPAM_KV: KVNamespace;
+}
+
+type PrivatePendingAction = {
+  chatId: number;
+  action: "set_rules_url";
+};
+
+const configContextKey = (userId: number) => `config_context:${userId}`;
+const configPendingKey = (userId: number) => `config_pending:${userId}`;
+
+function getCommandName(text: string, entities: MessageEntity[]): string | null {
+  const cmdEntity = entities.find((e) => e.type === "bot_command" && e.offset === 0);
+  if (!cmdEntity) return null;
+
+  const raw = text.slice(1, cmdEntity.length);
+  return raw.split("@")[0]?.toLowerCase() ?? null;
+}
+
+async function isAdminInChat(
+  api: import("grammy").Api,
+  chatId: number,
+  userId: number
+): Promise<boolean> {
+  try {
+    const member = await api.getChatMember(chatId, userId);
+    return member.status === "administrator" || member.status === "creator";
+  } catch {
+    return false;
+  }
+}
+
+function configSummary(config: GroupConfig): string {
+  return (
+    `⚙️ <b>Configuração atual</b>\n\n` +
+    `• Regras: <b>${config.rulesUrl ? "definidas" : "não definidas"}</b>\n` +
+    `• Apagar comandos de não-admin: <b>${config.deleteNonAdminCommands ? "on" : "off"}</b>\n` +
+    `• Anti-divulgação: <b>${config.antiPromotion ? "on" : "off"}</b>\n` +
+    `• Ação anti-divulgação: <b>${ANTI_PROMOTION_ACTION_LABEL[config.antiPromotionAction]}</b>\n` +
+    `• Conteúdo ofensivo: <b>${config.offensiveDetection ? "on" : "off"}</b>\n` +
+    `• Warns: <b>${config.maxWarns}</b> | Punição: <b>${PUNISHMENT_LABEL[config.punishment]}</b>`
+  );
+}
+
+function configKeyboard(chatId: number, config: GroupConfig): InlineKeyboard {
+  const antiPromotionNext = config.antiPromotion ? "off" : "on";
+  const offensiveNext = config.offensiveDetection ? "off" : "on";
+  const deleteCommandsNext = config.deleteNonAdminCommands ? "off" : "on";
+
+  return new InlineKeyboard()
+    .text(
+      `🧹 Comandos não-admin: ${config.deleteNonAdminCommands ? "ON" : "OFF"}`,
+      `cfg:${chatId}:delete_cmds:${deleteCommandsNext}`
+    )
+    .row()
+    .text(
+      `🚫 Anti-divulgação: ${config.antiPromotion ? "ON" : "OFF"}`,
+      `cfg:${chatId}:anti_promo:${antiPromotionNext}`
+    )
+    .row()
+    .text(
+      `🤬 Conteúdo ofensivo: ${config.offensiveDetection ? "ON" : "OFF"}`,
+      `cfg:${chatId}:offensive:${offensiveNext}`
+    )
+    .row()
+    .text("📜 Definir link de regras", `cfg:${chatId}:rules:set`)
+    .text("🗑️ Remover regras", `cfg:${chatId}:rules:clear`)
+    .row()
+    .text("🔄 Atualizar painel", `cfg:${chatId}:refresh`);
 }
 
 // ── KV helpers ────────────────────────────────────────────────────────────────
@@ -151,6 +227,270 @@ function createBot(env: Env): Bot {
   const timeoutMs = timeoutMinutes * 60 * 1000;
   const profileThreshold = parseFloat(env.PROFILE_CHECK_THRESHOLD ?? "0.85");
   const throttleSeconds = parseInt(env.GEMINI_THROTTLE_SECONDS ?? "60", 10);
+  const geminiMaxCallsPerMinute = parseInt(
+    env.GEMINI_MAX_CALLS_PER_MINUTE ?? "12",
+    10
+  );
+
+  const openPrivateConfigPanel = async (
+    userId: number,
+    chatId: number
+  ): Promise<void> => {
+    const chat = await bot.api.getChat(chatId);
+    if (chat.type !== "group" && chat.type !== "supergroup") {
+      await bot.api.sendMessage(userId, "❌ O contexto salvo não é um grupo válido.");
+      return;
+    }
+
+    const config = await getConfig(env.SPAM_KV, chatId);
+    const text =
+      `🛠️ <b>Painel do grupo</b>\n` +
+      `🏠 <b>${esc(chat.title)}</b>\n` +
+      `🆔 <code>${chatId}</code>\n\n` +
+      `${configSummary(config)}\n\n` +
+      `Use os botões abaixo para ajustar.`;
+
+    await bot.api.sendMessage(userId, text, {
+      parse_mode: "HTML",
+      reply_markup: configKeyboard(chatId, config),
+    });
+  };
+
+  const attachGroupContext = async (
+    userId: number,
+    chatId: number,
+    chatTitle: string
+  ): Promise<boolean> => {
+    await env.SPAM_KV.put(configContextKey(userId), String(chatId), {
+      expirationTtl: 60 * 60 * 6,
+    });
+
+    try {
+      await bot.api.sendMessage(
+        userId,
+        `✅ Contexto salvo para <b>${esc(chatTitle)}</b>.\n` +
+          `Abra /config aqui no privado para ajustar as opções do grupo.`,
+        { parse_mode: "HTML" }
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  bot.use(async (ctx, next) => {
+    if (!ctx.chat || !ctx.message) {
+      await next();
+      return;
+    }
+
+    const text = ctx.message.text ?? ctx.message.caption ?? "";
+    const entities = ctx.message.entities ?? ctx.message.caption_entities ?? [];
+    const commandName = getCommandName(text, entities);
+    if (!commandName) {
+      await next();
+      return;
+    }
+
+    if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
+      if (commandName === "start" || commandName === "config") {
+        await ctx.deleteMessage().catch(() => undefined);
+        if (!ctx.from) return;
+
+        const isAdmin = await isAdminInChat(ctx.api, ctx.chat.id, ctx.from.id);
+        if (!isAdmin) return;
+
+        const chatTitle = (ctx.chat as { title: string }).title;
+        const sentInPrivate = await attachGroupContext(
+          ctx.from.id,
+          ctx.chat.id,
+          chatTitle
+        );
+        if (!sentInPrivate) {
+          await ctx
+            .reply(
+              "⚠️ Não consegui te chamar no privado. Abra uma conversa com o bot e envie /start, depois use /config no grupo novamente."
+            )
+            .catch(() => undefined);
+        }
+        return;
+      }
+
+      const groupConfig = await getConfig(env.SPAM_KV, ctx.chat.id);
+      if (groupConfig.deleteNonAdminCommands && ctx.from) {
+        const isAdmin = await isAdminInChat(ctx.api, ctx.chat.id, ctx.from.id);
+        if (!isAdmin) {
+          await ctx.deleteMessage().catch(() => undefined);
+          return;
+        }
+      }
+    }
+
+    await next();
+  });
+
+  // ── /start and /config in private chat ───────────────────────────────────
+
+  bot.command(["start", "config"], async (ctx) => {
+    if (ctx.chat.type !== "private") return;
+    if (!ctx.from) return;
+
+    const allowed = await allowFixedWindow(
+      env.SPAM_KV,
+      `private_config_cmd:${ctx.from.id}`,
+      10,
+      60
+    );
+    if (!allowed) {
+      await ctx.reply("⏳ Muitas tentativas. Aguarde alguns segundos e tente novamente.");
+      return;
+    }
+
+    const contextRaw = await env.SPAM_KV.get(configContextKey(ctx.from.id));
+    if (!contextRaw) {
+      await ctx.reply(
+        "Para abrir o painel, use <code>/config</code> em um grupo onde o bot está ativo.\n" +
+          "Esse comando no grupo é apagado e salva o contexto automaticamente.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const chatId = parseInt(contextRaw, 10);
+    if (Number.isNaN(chatId)) {
+      await env.SPAM_KV.delete(configContextKey(ctx.from.id));
+      await ctx.reply("❌ Contexto inválido. Use /config no grupo novamente.");
+      return;
+    }
+
+    const isAdmin = await isAdminInChat(ctx.api, chatId, ctx.from.id);
+    if (!isAdmin) {
+      await ctx.reply(
+        "❌ Você não é admin do grupo salvo no contexto.\n" +
+          "Use /config no grupo correto para atualizar o contexto."
+      );
+      return;
+    }
+
+    await openPrivateConfigPanel(ctx.from.id, chatId);
+  });
+
+  bot.callbackQuery(/^cfg:(-?\d+):([a-z_]+)(?::([a-z_]+))?$/, async (ctx) => {
+    if (!ctx.from || ctx.chat?.type !== "private") return;
+
+    const allowed = await allowFixedWindow(
+      env.SPAM_KV,
+      `private_config_cb:${ctx.from.id}`,
+      30,
+      60
+    );
+    if (!allowed) {
+      await ctx.answerCallbackQuery({ text: "Aguarde alguns segundos." });
+      return;
+    }
+
+    const chatId = parseInt(ctx.match[1]!, 10);
+    const action = ctx.match[2]!;
+    const value = ctx.match[3] ?? "";
+
+    const isAdmin = await isAdminInChat(ctx.api, chatId, ctx.from.id);
+    if (!isAdmin) {
+      await ctx.answerCallbackQuery({ text: "Você não é admin desse grupo." });
+      return;
+    }
+
+    if (action === "rules" && value === "set") {
+      const pending: PrivatePendingAction = { chatId, action: "set_rules_url" };
+      await env.SPAM_KV.put(configPendingKey(ctx.from.id), JSON.stringify(pending), {
+        expirationTtl: 60 * 5,
+      });
+      await ctx.answerCallbackQuery({ text: "Envie agora o link das regras." });
+      await ctx.reply(
+        "Envie o link completo das regras (ex.: <code>https://...</code>).\n" +
+          "Você tem 5 minutos para concluir.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (action === "rules" && value === "clear") {
+      await saveConfig(env.SPAM_KV, chatId, { rulesUrl: null });
+      await ctx.answerCallbackQuery({ text: "Link de regras removido." });
+    } else if (action === "anti_promo" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, { antiPromotion: value === "on" });
+      await ctx.answerCallbackQuery({ text: "Anti-divulgação atualizada." });
+    } else if (action === "offensive" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, { offensiveDetection: value === "on" });
+      await ctx.answerCallbackQuery({ text: "Detecção ofensiva atualizada." });
+    } else if (action === "delete_cmds" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, {
+        deleteNonAdminCommands: value === "on",
+      });
+      await ctx.answerCallbackQuery({ text: "Filtro de comandos atualizado." });
+    } else if (action !== "refresh") {
+      await ctx.answerCallbackQuery({ text: "Ação inválida." });
+      return;
+    }
+
+    const chat = await ctx.api.getChat(chatId);
+    if (chat.type !== "group" && chat.type !== "supergroup") {
+      await ctx.answerCallbackQuery({ text: "Grupo inválido." });
+      return;
+    }
+
+    const config = await getConfig(env.SPAM_KV, chatId);
+    const text =
+      `🛠️ <b>Painel do grupo</b>\n` +
+      `🏠 <b>${esc(chat.title)}</b>\n` +
+      `🆔 <code>${chatId}</code>\n\n` +
+      `${configSummary(config)}\n\n` +
+      `Use os botões abaixo para ajustar.`;
+
+    await ctx.editMessageText(text, {
+      parse_mode: "HTML",
+      reply_markup: configKeyboard(chatId, config),
+    }).catch(() => undefined);
+  });
+
+  bot.on("message:text", async (ctx, next) => {
+    if (ctx.chat.type !== "private" || !ctx.from) {
+      await next();
+      return;
+    }
+
+    const pending = await env.SPAM_KV.get<PrivatePendingAction>(
+      configPendingKey(ctx.from.id),
+      "json"
+    );
+    if (!pending) {
+      await next();
+      return;
+    }
+
+    if (pending.action !== "set_rules_url") {
+      await env.SPAM_KV.delete(configPendingKey(ctx.from.id));
+      await next();
+      return;
+    }
+
+    const url = (ctx.message.text ?? "").trim();
+    if (!/^https?:\/\/\S+$/i.test(url)) {
+      await ctx.reply("❌ Link inválido. Envie uma URL começando com http:// ou https://");
+      return;
+    }
+
+    const isAdmin = await isAdminInChat(ctx.api, pending.chatId, ctx.from.id);
+    if (!isAdmin) {
+      await env.SPAM_KV.delete(configPendingKey(ctx.from.id));
+      await ctx.reply("❌ Você não é admin desse grupo.");
+      return;
+    }
+
+    await saveConfig(env.SPAM_KV, pending.chatId, { rulesUrl: url });
+    await env.SPAM_KV.delete(configPendingKey(ctx.from.id));
+    await ctx.reply("✅ Link de regras atualizado.");
+    await openPrivateConfigPanel(ctx.from.id, pending.chatId);
+  });
 
   // ── Warn commands ─────────────────────────────────────────────────────────
   registerWarnCommands(bot, env);
@@ -403,9 +743,20 @@ function createBot(env: Env): Bot {
   bot.callbackQuery(/^captcha:(\d+):(\d+)$/, async (ctx) => {
     const targetUserId = parseInt(ctx.match[1]!, 10);
     const answer = parseInt(ctx.match[2]!, 10);
-    const chat = ctx.chat;
+    const chat = ctx.chat ?? ctx.callbackQuery.message?.chat;
 
     if (!chat) return;
+
+    const allowed = await allowFixedWindow(
+      env.SPAM_KV,
+      `captcha_click:${chat.id}:${ctx.from.id}`,
+      8,
+      30
+    );
+    if (!allowed) {
+      await ctx.answerCallbackQuery({ text: "Muitas tentativas. Aguarde." });
+      return;
+    }
 
     // Only the challenged user may answer
     if (ctx.from.id !== targetUserId) {
@@ -431,6 +782,24 @@ function createBot(env: Env): Bot {
 
     if (answer === data.correct) {
       await ctx.answerCallbackQuery({ text: "✅ Correto! Bem-vindo(a)!" });
+      const config = await getConfig(env.SPAM_KV, chat.id);
+      if (config.rulesUrl) {
+        const rulesKeyboard = new InlineKeyboard().url(
+          "📜 Regras do grupo",
+          config.rulesUrl
+        );
+        await ctx.api
+          .sendMessage(
+            chat.id,
+            `✅ <a href="tg://user?id=${targetUserId}">${data.firstName}</a> concluiu o captcha.\n` +
+              `Leia as regras no botão abaixo:`,
+            {
+              parse_mode: "HTML",
+              reply_markup: rulesKeyboard,
+            }
+          )
+          .catch(() => undefined);
+      }
       await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
         `✅ <b>CAPTCHA APROVADO</b>\n\n` +
         `👤 Usuário: ${ulink(targetUserId, data.firstName)} <code>${targetUserId}</code>`
@@ -570,6 +939,13 @@ function createBot(env: Env): Bot {
       }
     }
     if (await isThrottled(env.SPAM_KV, chat.id, from.id)) return;
+
+    const geminiSlot = await reserveGeminiChatSlot(
+      env.SPAM_KV,
+      chat.id,
+      geminiMaxCallsPerMinute
+    );
+    if (!geminiSlot) return;
 
     const links = extractLinks(text, entities);
 
