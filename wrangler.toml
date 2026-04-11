@@ -8,7 +8,7 @@ SPAM_THRESHOLD = "0.60"
 # Number of spam warnings before the user is banned
 MAX_WARNINGS = "3"
 # Gemini model to use for spam analysis
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 # Minutes a new member has to solve the captcha before being kicked
 CAPTCHA_TIMEOUT_MINUTES = "15"
 # Confidence threshold for profile-based removal (photo + bio analysis)

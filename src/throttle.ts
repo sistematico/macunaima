@@ -6,7 +6,7 @@
  * will NOT be called again for that user within the window.
  *
  * This is the primary mechanism to stay within the free-tier rate limit
- * (gemini-1.5-flash: 15 RPM / 1500 RPD).
+ * (gemini-2.0-flash: 15 RPM / 1500 RPD).
  */
 
 const KEY = (chatId: number, userId: number) =>
