@@ -24,6 +24,7 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild",
+      "protobufjs",
       "sharp",
       "workerd"
     ]
