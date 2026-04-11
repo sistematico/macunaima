@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import type { MessageEntity } from "grammy/types";
-import { analyzeContent, generateIntroPhrase, hasSpamKeywords, heuristicAnalysis } from "./spam-detector";
+import { analyzeContent, generateIntroPhrase, hasSpamKeywords, heuristicAnalysis, randomFallbackIntro } from "./spam-detector";
 import {
   allowFixedWindow,
   isThrottled,
@@ -916,59 +916,60 @@ function createBot(env: Env): Bot {
 
     if (!mentionedByEntity && !mentionedByName) return;
 
-    // ── Idempotency guard — deduplicate by message_id ─────────────────────
-    // Telegram retries webhooks if the Worker takes too long (e.g. Gemini).
-    // KV eventual consistency means the debounce key below can't fully protect
-    // against concurrent retries. Using the message_id as a one-shot flag
-    // ensures exactly one reply per mention, regardless of retries.
-    const dedupKey = `intro_sent:${chat.id}:${message.message_id}`;
-    if ((await env.SPAM_KV.get(dedupKey)) !== null) return;
-    await env.SPAM_KV.put(dedupKey, "1", { expirationTtl: 300 });
-
-    // ── Always count mention towards spam window ───────────────────────────
-    const bucket = Math.floor(Date.now() / 1000 / INTRO_WINDOW_SECONDS);
-    const windowKey = `intro_window:${chat.id}:${bucket}`;
-    const windowCount =
-      parseInt((await env.SPAM_KV.get(windowKey)) ?? "0", 10) + 1;
-    await env.SPAM_KV.put(windowKey, String(windowCount), {
-      expirationTtl: Math.max(60, INTRO_WINDOW_SECONDS + 10),
-    });
-
-    // Trip the lockout if spam threshold exceeded
-    if (windowCount > INTRO_SPAM_LIMIT) {
-      await env.SPAM_KV.put(`intro_lock:${chat.id}`, "1", {
-        expirationTtl: INTRO_LOCKOUT_SECONDS,
-      });
-      return;
-    }
-
-    // ── Check lockout ─────────────────────────────────────────────────────
-    if ((await env.SPAM_KV.get(`intro_lock:${chat.id}`)) !== null) return;
-
-    // ── Per-user throttle ─────────────────────────────────────────────────
-    const userKey = `intro_user:${chat.id}:${from.id}`;
-    if ((await env.SPAM_KV.get(userKey)) !== null) return;
-
-    // ── Group debounce ────────────────────────────────────────────────────
+    // ── Idempotency guard (dedup + all throttles in one parallel read) ────
+    // All KV reads run in parallel to minimise latency and reduce the window
+    // in which Telegram could retry the webhook and cause a double reply.
+    const dedupKey    = `intro_sent:${chat.id}:${message.message_id}`;
+    const lockKey     = `intro_lock:${chat.id}`;
+    const userKey     = `intro_user:${chat.id}:${from.id}`;
     const debounceKey = `intro_debounce:${chat.id}`;
-    if ((await env.SPAM_KV.get(debounceKey)) !== null) return;
 
-    // Set throttles before the API call so concurrent requests don't race
+    const [dedup, lock, userThrottle, debounce] = await Promise.all([
+      env.SPAM_KV.get(dedupKey),
+      env.SPAM_KV.get(lockKey),
+      env.SPAM_KV.get(userKey),
+      env.SPAM_KV.get(debounceKey),
+    ]);
+
+    if (dedup !== null || lock !== null || userThrottle !== null || debounce !== null) return;
+
+    // Write all guards atomically before doing any slow work
     await Promise.all([
-      env.SPAM_KV.put(userKey, "1", { expirationTtl: INTRO_USER_TTL }),
+      env.SPAM_KV.put(dedupKey,    "1", { expirationTtl: 300 }),
+      env.SPAM_KV.put(userKey,     "1", { expirationTtl: INTRO_USER_TTL }),
       env.SPAM_KV.put(debounceKey, "1", { expirationTtl: INTRO_DEBOUNCE_TTL }),
     ]);
 
-    let phrase: string;
-    try {
-      phrase = await generateIntroPhrase(botFirstName, env.GOOGLE_AI_API_KEY, geminiModel);
-      if (!phrase) throw new Error("empty response");
-    } catch (err) {
-      console.error("generateIntroPhrase failed:", err);
-      phrase = `Oi! Sou o ${botFirstName}, bot de moderação deste grupo. 🤖`;
-    }
+    // ── Count mention towards spam window (fire-and-forget) ───────────────
+    const bucket    = Math.floor(Date.now() / 1000 / INTRO_WINDOW_SECONDS);
+    const windowKey = `intro_window:${chat.id}:${bucket}`;
+    env.SPAM_KV.get(windowKey).then(async (raw) => {
+      const count = parseInt(raw ?? "0", 10) + 1;
+      await env.SPAM_KV.put(windowKey, String(count), {
+        expirationTtl: Math.max(60, INTRO_WINDOW_SECONDS + 10),
+      });
+      if (count > INTRO_SPAM_LIMIT) {
+        await env.SPAM_KV.put(lockKey, "1", { expirationTtl: INTRO_LOCKOUT_SECONDS });
+      }
+    }).catch(() => undefined);
 
-    await ctx.reply(phrase).catch(() => undefined);
+    // ── Reply immediately with a fallback, then try to edit with AI phrase ─
+    // Sending the fallback first ensures Telegram gets a fast response and
+    // never retries the webhook, eliminating the duplicate-message problem.
+    const fallback = randomFallbackIntro(botFirstName);
+    const sent = await ctx.reply(fallback).catch(() => null);
+
+    if (sent) {
+      generateIntroPhrase(botFirstName, env.GOOGLE_AI_API_KEY, geminiModel)
+        .then((aiPhrase) => {
+          if (aiPhrase && aiPhrase !== fallback) {
+            ctx.api
+              .editMessageText(chat.id, sent.message_id, aiPhrase)
+              .catch(() => undefined);
+          }
+        })
+        .catch((err) => console.error("generateIntroPhrase failed:", err));
+    }
   });
 
   // ── Rules request detection ───────────────────────────────────────────────
@@ -1031,7 +1032,7 @@ function createBot(env: Env): Bot {
         const action = groupConfig.antiPromotionAction;
 
         if (action === "warn") {
-          const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id);
+          const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id, chatTitle, "Divulgação de grupo/canal");
 
           await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
             `📢 <b>DIVULGAÇÃO BLOQUEADA</b>\n\n` +
@@ -1043,7 +1044,7 @@ function createBot(env: Env): Bot {
           if (warnCount >= groupConfig.maxWarns) {
             try {
               await applyPunishment(ctx.api, chat.id, from.id, groupConfig.punishment);
-              await clearWarns(env.SPAM_KV, chat.id, from.id);
+              await clearWarns(env.SPAM_KV, chat.id, from.id, chatTitle);
               await ctx.reply(
                 `🚫 ${userMention} atingiu <b>${warnCount}/${groupConfig.maxWarns}</b> avisos.\n` +
                   `Punição: <b>${PUNISHMENT_LABEL[groupConfig.punishment]}</b>\n` +
@@ -1204,7 +1205,7 @@ function createBot(env: Env): Bot {
 
       try { await ctx.deleteMessage(); } catch { /* no permission */ }
 
-      const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id);
+      const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id, chatTitle, `Conteúdo ofensivo automático: ${analysis.offensiveCategory}`);
 
       await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
         `🤬 <b>CONTEÚDO OFENSIVO REMOVIDO</b>\n\n` +
@@ -1218,7 +1219,7 @@ function createBot(env: Env): Bot {
       if (warnCount >= groupConfig.maxWarns) {
         try {
           await applyPunishment(ctx.api, chat.id, from.id, groupConfig.punishment);
-          await clearWarns(env.SPAM_KV, chat.id, from.id);
+          await clearWarns(env.SPAM_KV, chat.id, from.id, chatTitle);
           await ctx.reply(
             `🚫 ${userMention} atingiu <b>${warnCount}/${groupConfig.maxWarns}</b> avisos.\n` +
               `Punição: <b>${PUNISHMENT_LABEL[groupConfig.punishment]}</b>\n` +

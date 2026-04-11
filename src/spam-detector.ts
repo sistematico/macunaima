@@ -287,15 +287,26 @@ export async function analyzeContent(
 
 // ── Self-introduction generator ────────────────────────────────────────────────
 
+// Fallback phrases used when the AI is unavailable or too slow.
+// Varied enough so the bot never feels repetitive on quota errors.
+const FALLBACK_INTROS = [
+  (n: string) => `Oi! Sou o ${n}, guardião deste grupo contra spam e golpes. 🤖`,
+  (n: string) => `${n} presente! Cuido da moderação por aqui — spam, golpes e conteúdo ofensivo não passam.`,
+  (n: string) => `Olá! O ${n} está de olho. Minha função é manter este grupo limpo e seguro.`,
+  (n: string) => `Às suas ordens! Sou o ${n}, bot de moderação — detecto spam, aplico captcha e muito mais.`,
+  (n: string) => `${n} aqui! Deixa comigo a moderação: spam, divulgações e golpes eu resolvo.`,
+];
+
+export function randomFallbackIntro(botName: string): string {
+  const fn = FALLBACK_INTROS[Math.floor(Math.random() * FALLBACK_INTROS.length)]!;
+  return fn(botName);
+}
+
 const INTRO_PROMPT = `Você é {{BOT_NAME}}, um bot de moderação para grupos do Telegram.
-Alguém mencionou seu nome ou @ no grupo. Gere UMA frase de apresentação curta (1 a 3 frases),
-em português brasileiro, diferente a cada chamada. Seja criativo, amigável e levemente bem-humorado.
-
-Suas funções principais incluem: detectar spam e golpes automaticamente, aplicar captcha para novos membros,
-bloquear divulgações não autorizadas de grupos/canais, detectar conteúdo ofensivo e aplicar advertências.
-
-Varie o estilo: às vezes formal, às vezes descontraído, às vezes use metáforas, às vezes seja direto.
-Nunca repita a mesma frase. Não use markdown. Apenas o texto da resposta, sem aspas.`;
+Alguém mencionou seu nome no grupo. Escreva EXATAMENTE UMA frase curta de apresentação em português brasileiro.
+Seja criativo e varie o estilo a cada chamada (formal, descontraído, com metáfora, direto…).
+Mencione brevemente que você modera o grupo (spam, golpes, segurança).
+Sem markdown, sem aspas, sem quebras de linha. Apenas a frase.`;
 
 export async function generateIntroPhrase(
   botName: string,
