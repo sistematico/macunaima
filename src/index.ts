@@ -916,6 +916,15 @@ function createBot(env: Env): Bot {
 
     if (!mentionedByEntity && !mentionedByName) return;
 
+    // ── Idempotency guard — deduplicate by message_id ─────────────────────
+    // Telegram retries webhooks if the Worker takes too long (e.g. Gemini).
+    // KV eventual consistency means the debounce key below can't fully protect
+    // against concurrent retries. Using the message_id as a one-shot flag
+    // ensures exactly one reply per mention, regardless of retries.
+    const dedupKey = `intro_sent:${chat.id}:${message.message_id}`;
+    if ((await env.SPAM_KV.get(dedupKey)) !== null) return;
+    await env.SPAM_KV.put(dedupKey, "1", { expirationTtl: 300 });
+
     // ── Always count mention towards spam window ───────────────────────────
     const bucket = Math.floor(Date.now() / 1000 / INTRO_WINDOW_SECONDS);
     const windowKey = `intro_window:${chat.id}:${bucket}`;
