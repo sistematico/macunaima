@@ -341,8 +341,8 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
       await ctx.reply(
         "❌ Responda a uma mensagem ou mencione o usuário.\n" +
         "Exemplos:\n" +
-        "• <code>/warn motivo</code> (respondendo a mensagem)\n" +
-        "• <code>/warn @usuário motivo</code>",
+        "• <code>/warn [motivo]</code> (respondendo a mensagem)\n" +
+        "• <code>/warn @usuário [motivo]</code>",
         { parse_mode: "HTML" }
       );
       return;
