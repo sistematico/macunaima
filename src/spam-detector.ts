@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { withRetry } from "./retry";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -258,11 +258,7 @@ export async function analyzeContent(
   apiKey: string,
   model: string
 ): Promise<ContentAnalysis> {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const generativeModel = genAI.getGenerativeModel({
-    model,
-    generationConfig: { responseMimeType: "application/json" },
-  });
+  const ai = new GoogleGenAI({ apiKey });
 
   const linksSection =
     links.length > 0
@@ -274,9 +270,15 @@ export async function analyzeContent(
     linksSection
   );
 
-  const result = await withRetry(() => generativeModel.generateContent(prompt));
+  const result = await withRetry(() =>
+    ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: { responseMimeType: "application/json" },
+    })
+  );
   const fallback = heuristicAnalysis(text, links);
-  const parsed = parseJsonObject(result.response.text());
+  const parsed = parseJsonObject(result.text ?? "");
   if (!parsed) return fallback;
 
   const modelAnalysis = normalizeModelOutput(parsed);
@@ -300,10 +302,11 @@ export async function generateIntroPhrase(
   apiKey: string,
   model: string
 ): Promise<string> {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const generativeModel = genAI.getGenerativeModel({ model });
+  const ai = new GoogleGenAI({ apiKey });
 
   const prompt = INTRO_PROMPT.replace("{{BOT_NAME}}", botName);
-  const result = await withRetry(() => generativeModel.generateContent(prompt));
-  return result.response.text().trim();
+  const result = await withRetry(() =>
+    ai.models.generateContent({ model, contents: prompt })
+  );
+  return (result.text ?? "").trim();
 }

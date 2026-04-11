@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { withRetry } from "./retry";
 
 export interface ProfileCheckResult {
@@ -150,21 +150,26 @@ export async function checkProfilePhoto(
     return { flagged: false, confidence: 0, reason: "Não foi possível baixar a foto" };
   }
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const generativeModel = genAI.getGenerativeModel({
-    model,
-    generationConfig: { responseMimeType: "application/json" },
-  });
+  const ai = new GoogleGenAI({ apiKey });
 
   const result = await withRetry(() =>
-    generativeModel.generateContent([
-      { inlineData: imageData },
-      { text: PHOTO_PROMPT },
-    ])
+    ai.models.generateContent({
+      model,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { inlineData: imageData },
+            { text: PHOTO_PROMPT },
+          ],
+        },
+      ],
+      config: { responseMimeType: "application/json" },
+    })
   );
 
   return (
-    parseProfileResult(result.response.text()) ?? {
+    parseProfileResult(result.text ?? "") ?? {
       flagged: false,
       confidence: 0,
       reason: "Resposta inválida do modelo",
@@ -227,20 +232,18 @@ export async function checkProfileText(
     .filter(Boolean)
     .join("\n");
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const generativeModel = genAI.getGenerativeModel({
-    model,
-    generationConfig: { responseMimeType: "application/json" },
-  });
+  const ai = new GoogleGenAI({ apiKey });
 
   const result = await withRetry(() =>
-    generativeModel.generateContent(
-      TEXT_PROMPT.replace("{{PROFILE}}", profileText)
-    )
+    ai.models.generateContent({
+      model,
+      contents: TEXT_PROMPT.replace("{{PROFILE}}", profileText),
+      config: { responseMimeType: "application/json" },
+    })
   );
 
   return (
-    parseProfileResult(result.response.text()) ?? {
+    parseProfileResult(result.text ?? "") ?? {
       flagged: false,
       confidence: 0,
       reason: "Resposta inválida do modelo",
