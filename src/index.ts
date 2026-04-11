@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import type { MessageEntity } from "grammy/types";
-import { analyzeContent, generateIntroPhrase, heuristicAnalysis } from "./spam-detector";
+import { analyzeContent, generateIntroPhrase, hasSpamKeywords, heuristicAnalysis } from "./spam-detector";
 import {
   allowFixedWindow,
   isThrottled,
@@ -1057,77 +1057,45 @@ function createBot(env: Env): Bot {
         return; // Stop processing — no need for Gemini analysis
       }
     }
-    // ── Heuristic pre-check (free, runs even when user is throttled) ──────────
-    // Regex-based patterns catch high-confidence spam without spending API quota.
-    // If confident enough, act immediately and skip Gemini entirely.
-
     const chatTitle = (chat as { title: string }).title;
     const userMention = from.username
       ? `@${from.username}`
       : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
 
-    const heuristic = heuristicAnalysis(text, links);
-    if (heuristic.isSpam && heuristic.spamConfidence >= spamThreshold) {
-      try { await ctx.deleteMessage(); } catch { /* no permission */ }
+    // ── Keyword pre-filter ────────────────────────────────────────────────────
+    // If no suspicious keywords are found, skip analysis entirely (saves quota).
+    // Keywords are intentionally broad — the AI makes the final call.
 
-      const warnings = await incrementWarnings(env.SPAM_KV, chat.id, from.id);
+    if (!hasSpamKeywords(text, links)) return;
 
-      await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
-        `🗑️ <b>SPAM REMOVIDO</b>\n\n` +
-        `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
-        `📋 Categoria: <i>${esc(heuristic.spamCategory)}</i>\n` +
-        `📊 Confiança: <b>${Math.round(heuristic.spamConfidence * 100)}%</b>  Aviso spam: <b>${warnings}/${maxWarnings}</b>\n` +
-        `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
-      );
-
-      if (warnings >= maxWarnings) {
-        try {
-          await ctx.banChatMember(from.id);
-          await ctx.reply(`🚫 ${userMention} foi banido por spam repetido.`, { parse_mode: "HTML" });
-          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
-            `🚫 <b>BAN POR SPAM</b>\n\n` +
-            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
-            `📊 Avisos de spam: <b>${warnings}/${maxWarnings}</b>`
-          );
-        } catch {
-          await ctx.reply(
-            `⛔ ${userMention} atingiu o limite de avisos (${maxWarnings}/${maxWarnings}). ` +
-              `Não tenho permissão para banir — por favor, remova manualmente.`,
-            { parse_mode: "HTML" }
-          );
-        }
-      } else {
-        await ctx.reply(
-          `⚠️ Mensagem de ${userMention} removida por spam.\n` +
-            `📋 Categoria: <i>${heuristic.spamCategory}</i>\n` +
-            `📊 Aviso spam ${warnings}/${maxWarnings}`,
-          { parse_mode: "HTML" }
-        );
-      }
-      return;
-    }
-
-    // ── Throttle + Gemini analysis ────────────────────────────────────────────
-
-    if (await isThrottled(env.SPAM_KV, chat.id, from.id)) return;
+    // ── Gemini analysis (rate-limited per chat) ───────────────────────────────
+    // Per-user throttle is intentionally skipped: when keywords are present the
+    // message is suspicious enough to always warrant an AI check, regardless of
+    // how recently we analysed this user. The per-chat slot limit prevents abuse.
 
     const geminiSlot = await reserveGeminiChatSlot(
       env.SPAM_KV,
       chat.id,
       geminiMaxCallsPerMinute
     );
-    if (!geminiSlot) return;
 
     let analysis: Awaited<ReturnType<typeof analyzeContent>>;
-    try {
-      analysis = await analyzeContent(text, links, env.GOOGLE_AI_API_KEY, geminiModel);
-    } catch (err) {
-      console.error("Gemini analysis failed:", err);
-      return;
-    }
 
-    // Mark user as recently checked — regardless of result
-    await setThrottle(env.SPAM_KV, chat.id, from.id, throttleSeconds);
+    if (!geminiSlot) {
+      // No Gemini slot available — fall back to heuristic only.
+      analysis = heuristicAnalysis(text, links);
+    } else {
+      try {
+        analysis = await analyzeContent(text, links, env.GOOGLE_AI_API_KEY, geminiModel);
+      } catch (err) {
+        console.error("Gemini analysis failed:", err);
+        // Fall back to heuristic so spam is not silently ignored.
+        analysis = heuristicAnalysis(text, links);
+      }
+
+      // Mark user as recently seen (informational — no longer a hard gate).
+      await setThrottle(env.SPAM_KV, chat.id, from.id, throttleSeconds);
+    }
 
     // ── Spam (takes priority over offensive) ─────────────────────────────────
 

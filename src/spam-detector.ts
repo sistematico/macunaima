@@ -37,6 +37,42 @@ const ADULT_PATTERN =
 const SUSPICIOUS_LINK_PATTERN =
   /(bit\.ly|tinyurl\.com|cutt\.ly|rb\.gy|t\.me\/\+|wa\.me\/|grabify|iplogger|discord\.gg)/i;
 
+// ── Keyword pre-filter ─────────────────────────────────────────────────────────
+//
+// Intentionally broad — these patterns cast a wide net so that ANY suspicious
+// message is forwarded to the AI for a final verdict. The AI (not the regex)
+// decides whether the message is actually spam.
+
+const KEYWORD_TRIGGER_PATTERNS: RegExp[] = [
+  // Shortened / obfuscated links anywhere in raw text (with or without https://)
+  /(bit\.ly|tinyurl\.com|cutt\.ly|rb\.gy|t\.me\/\+|wa\.me\/|grabify|iplogger)/i,
+  // Investment / crypto / trading keywords
+  /\b(cripto|bitcoin|btc|eth|usdt|forex|trader|investimento|invista|ganhe|lucre|renda\s*extra|dinheiro\s*r[aá]pido)\b/i,
+  // Percentage-gain promises (e.g. "300% em 7 dias", "200% ao mês")
+  /\b\d{2,4}\s*%\b/,
+  // Urgency / scarcity / exclusive-access phrases
+  /(vagas?\s*limitadas?|oportunidade\s*[uú]nica|por\s*tempo\s*limitado|acesso\s*exclusivo|acesse\s*agora|clique\s*agora|entre\s*agora|garantido\s*hoje)/i,
+  // Betting / casino / gambling
+  /\b(bet|bets|cassino|aposta|apostas|slot|roleta|tigrinho|jogo\s*do\s*tigre)\b/i,
+  // Fraud / scam terms
+  /\b(golpe|golpista|fraude|phishing|hacke|pix\s*gr[aá]tis|cart[aã]o\s*clonado)\b/i,
+  // Adult / escort content
+  /\b(onlyfans|privacy|pack\s*vip|nudes?|er[oó]tico|acompanhante|escort|webcam\s*adulta|porn[oô])\b/i,
+  // Money-mule phrases
+  /sem\s*cobran[cç]a\s*antecipada|minha\s*parte\s*ap[oó]s|ap[oó]s\s*(os\s*)?saques?\s*cai/i,
+  // VIP group / signal solicitation
+  /\b(sinal\s*vip|grupo\s*vip|canal\s*vip|empr[eé]stimo\s*f[aá]cil)\b/i,
+];
+
+/**
+ * Returns true if the message contains any keyword that warrants AI analysis.
+ * Intentionally broad — the AI makes the final spam/non-spam verdict.
+ */
+export function hasSpamKeywords(text: string, links: string[]): boolean {
+  const haystack = `${text} ${links.join(" ")}`;
+  return KEYWORD_TRIGGER_PATTERNS.some((p) => p.test(haystack));
+}
+
 function clamp01(value: unknown): number {
   const n = typeof value === "number" ? value : parseFloat(String(value ?? "0"));
   if (!Number.isFinite(n)) return 0;
