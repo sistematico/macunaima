@@ -26,6 +26,11 @@ const DEFAULT_ANALYSIS: ContentAnalysis = {
 const SPAM_OR_SCAM_PATTERN =
   /\b(bet|bets|cassino|aposta|apostas|slot|roleta|tigrinho|jogo\s*do\s*tigre|golpe|golpista|fraude|phishing|hacke|cart[aã]o\s*clonado|pix\s*gr[aá]tis|renda\s*extra|trader|forex|cripto|bitcoin|sinal\s*vip|grupo\s*vip|empr[eé]stimo\s*f[aá]cil)\b/i;
 
+// Money-mule / account-farming patterns: sharing accounts with betting/financial platforms
+// for a percentage cut, with no upfront payment. These phrases are highly specific to this scam.
+const MONEY_MULE_PATTERN =
+  /sem\s*cobran[cç]a\s*antecipada|minha\s*parte\s*ap[oó]s|ap[oó]s\s*(os\s*)?saques?\s*cai|subindo\s*(at[eé]\s*)?\d+\s*k?\s*(por|na)\s*conta|conta\s*(nova|antiga).*\d+\s*%|acesso\s*da\s*conta.*sem\s*cobran|sem\s*acesso\s*da\s*conta|\b(lavagem|mula\s*financ)/i;
+
 const ADULT_PATTERN =
   /\b(onlyfans|privacy|conte[úu]do\s*adulto|pack\s*vip|nudes?|sexo|er[oó]tico|acompanhante|escort|gp\b|garota\s*de\s*programa|massagem\s*sensual|webcam\s*adulta|porn[oô])\b/i;
 
@@ -70,10 +75,11 @@ function normalizeModelOutput(parsed: Record<string, unknown>): ContentAnalysis 
   };
 }
 
-function heuristicAnalysis(text: string, links: string[]): ContentAnalysis {
+export function heuristicAnalysis(text: string, links: string[]): ContentAnalysis {
   const haystack = `${text} ${links.join(" ")}`;
   const hasAdultSignal = ADULT_PATTERN.test(haystack);
   const hasScamSignal = SPAM_OR_SCAM_PATTERN.test(haystack);
+  const hasMoneyMuleSignal = MONEY_MULE_PATTERN.test(haystack);
   const hasSuspiciousLink = links.some((l) => SUSPICIOUS_LINK_PATTERN.test(l));
 
   if (hasAdultSignal) {
@@ -85,6 +91,18 @@ function heuristicAnalysis(text: string, links: string[]): ContentAnalysis {
       offensiveConfidence: 0.86,
       offensiveCategory: "sexual_explicit",
       reason: "Padrões de conteúdo sexual/erótico detectados",
+    };
+  }
+
+  if (hasMoneyMuleSignal) {
+    return {
+      isSpam: true,
+      spamConfidence: 0.95,
+      spamCategory: "money_mule_account_farming",
+      isOffensive: false,
+      offensiveConfidence: 0,
+      offensiveCategory: "clean",
+      reason: "Esquema de mula financeira / empréstimo de conta em BET detectado",
     };
   }
 
@@ -151,6 +169,8 @@ Flag as spam if the message is:
 - Job scams ("easy money", "work from home" with suspicious links)
 - Gambling/BET ads (sports betting, casino, slots, "tigrinho", sure-win tips)
 - Fraud/scam terms in Portuguese and English (golpe, fraude, phishing, fake support)
+- Money-mule / account-farming schemes: offering to deposit money into someone's betting/bank account in exchange for a percentage of withdrawals, with no upfront payment required ("sem cobrança antecipada", "minha parte após os saques", "subindo X na conta", "conta nova ou antiga", "sem acesso da conta")
+- Account sharing or lending solicitations for financial/betting platforms
 
 NOT spam: normal conversation, questions, legitimate news, opinions, bot commands.
 
@@ -221,4 +241,29 @@ export async function analyzeContent(
 
   const modelAnalysis = normalizeModelOutput(parsed);
   return mergeAnalyses(modelAnalysis, fallback);
+}
+
+// ── Self-introduction generator ────────────────────────────────────────────────
+
+const INTRO_PROMPT = `Você é {{BOT_NAME}}, um bot de moderação para grupos do Telegram.
+Alguém mencionou seu nome ou @ no grupo. Gere UMA frase de apresentação curta (1 a 3 frases),
+em português brasileiro, diferente a cada chamada. Seja criativo, amigável e levemente bem-humorado.
+
+Suas funções principais incluem: detectar spam e golpes automaticamente, aplicar captcha para novos membros,
+bloquear divulgações não autorizadas de grupos/canais, detectar conteúdo ofensivo e aplicar advertências.
+
+Varie o estilo: às vezes formal, às vezes descontraído, às vezes use metáforas, às vezes seja direto.
+Nunca repita a mesma frase. Não use markdown. Apenas o texto da resposta, sem aspas.`;
+
+export async function generateIntroPhrase(
+  botName: string,
+  apiKey: string,
+  model: string
+): Promise<string> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const generativeModel = genAI.getGenerativeModel({ model });
+
+  const prompt = INTRO_PROMPT.replace("{{BOT_NAME}}", botName);
+  const result = await withRetry(() => generativeModel.generateContent(prompt));
+  return result.response.text().trim();
 }

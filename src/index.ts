@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import type { MessageEntity } from "grammy/types";
-import { analyzeContent } from "./spam-detector";
+import { analyzeContent, generateIntroPhrase, heuristicAnalysis } from "./spam-detector";
 import {
   allowFixedWindow,
   isThrottled,
@@ -831,6 +831,116 @@ function createBot(env: Env): Bot {
     }
   });
 
+  // ── Bot mention → self-introduction ──────────────────────────────────────
+  //
+  // Rate limiting strategy (all backed by KV):
+  //   intro_user:{chatId}:{userId}   — per-user throttle  (10 min)
+  //   intro_debounce:{chatId}        — group debounce: only one reply per minute
+  //   intro_window:{chatId}:{bucket} — 2-min bucket counter for all mentions
+  //   intro_lock:{chatId}            — 1-hour silence when spam detected (> 5/2 min)
+  //
+  // Mention counting always runs (even when throttled/debounced), so abusers
+  // who rotate messages still trip the spam lockout.
+
+  const INTRO_SPAM_LIMIT = 5;          // max mentions per 2-min window before lockout
+  const INTRO_WINDOW_SECONDS = 120;    // window size for spam counting
+  const INTRO_LOCKOUT_SECONDS = 3600;  // 1 hour lockout on spam
+  const INTRO_USER_TTL = 600;          // 10-min per-user throttle
+  const INTRO_DEBOUNCE_TTL = 60;       // 60-second group debounce
+
+  bot.on("message", async (ctx) => {
+    const { chat, from, message } = ctx;
+
+    if (chat.type !== "group" && chat.type !== "supergroup") return;
+    if (!from || from.is_bot) return;
+
+    const text = message.text ?? message.caption ?? "";
+    const entities = message.entities ?? message.caption_entities ?? [];
+
+    // Detect mention of bot by @username (entity) or by first name in text
+    const botUsername = ctx.me.username ?? "";
+    const botFirstName = ctx.me.first_name;
+    const mentionedByEntity = entities.some(
+      (e) =>
+        e.type === "mention" &&
+        text.slice(e.offset, e.offset + e.length).toLowerCase() ===
+          `@${botUsername.toLowerCase()}`
+    );
+    const nameEscaped = botFirstName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mentionedByName =
+      botFirstName.length >= 3 &&
+      new RegExp(`\\b${nameEscaped}\\b`, "i").test(text);
+
+    if (!mentionedByEntity && !mentionedByName) return;
+
+    // ── Always count mention towards spam window ───────────────────────────
+    const bucket = Math.floor(Date.now() / 1000 / INTRO_WINDOW_SECONDS);
+    const windowKey = `intro_window:${chat.id}:${bucket}`;
+    const windowCount =
+      parseInt((await env.SPAM_KV.get(windowKey)) ?? "0", 10) + 1;
+    await env.SPAM_KV.put(windowKey, String(windowCount), {
+      expirationTtl: Math.max(60, INTRO_WINDOW_SECONDS + 10),
+    });
+
+    // Trip the lockout if spam threshold exceeded
+    if (windowCount > INTRO_SPAM_LIMIT) {
+      await env.SPAM_KV.put(`intro_lock:${chat.id}`, "1", {
+        expirationTtl: INTRO_LOCKOUT_SECONDS,
+      });
+      return;
+    }
+
+    // ── Check lockout ─────────────────────────────────────────────────────
+    if ((await env.SPAM_KV.get(`intro_lock:${chat.id}`)) !== null) return;
+
+    // ── Per-user throttle ─────────────────────────────────────────────────
+    const userKey = `intro_user:${chat.id}:${from.id}`;
+    if ((await env.SPAM_KV.get(userKey)) !== null) return;
+
+    // ── Group debounce ────────────────────────────────────────────────────
+    const debounceKey = `intro_debounce:${chat.id}`;
+    if ((await env.SPAM_KV.get(debounceKey)) !== null) return;
+
+    // Set throttles before the API call so concurrent requests don't race
+    await Promise.all([
+      env.SPAM_KV.put(userKey, "1", { expirationTtl: INTRO_USER_TTL }),
+      env.SPAM_KV.put(debounceKey, "1", { expirationTtl: INTRO_DEBOUNCE_TTL }),
+    ]);
+
+    let phrase: string;
+    try {
+      phrase = await generateIntroPhrase(botFirstName, env.GOOGLE_AI_API_KEY, geminiModel);
+    } catch {
+      phrase = `Oi! Sou o ${botFirstName}, bot de moderação deste grupo. 🤖`;
+    }
+
+    await ctx.reply(phrase).catch(() => undefined);
+  });
+
+  // ── Rules request detection ───────────────────────────────────────────────
+
+  const RULES_REQUEST_PATTERN =
+    /\b(regras?\s*do\s*grupo|regras?\s*da\s*comunidade|quais?\s*s[aã]o\s*as\s*regras?|onde\s*(est[aá]|ficam?|t[eê]m?)\s*as\s*regras?|tem\s*regras?\s*aqui|regras?\s*do\s*chat|ver\s*as?\s*regras?|link\s*(das?|de)\s*regras?)\b/i;
+
+  bot.on("message", async (ctx) => {
+    const { chat, from, message } = ctx;
+
+    if (chat.type !== "group" && chat.type !== "supergroup") return;
+    if (!from || from.is_bot) return;
+
+    const text = message.text ?? message.caption ?? "";
+    if (!RULES_REQUEST_PATTERN.test(text)) return;
+
+    const config = await getConfig(env.SPAM_KV, chat.id);
+    if (!config.rulesUrl) return;
+
+    const rulesKeyboard = new InlineKeyboard().url("📜 Regras do grupo", config.rulesUrl);
+    await ctx.reply("📜 Aqui estão as regras do grupo:", {
+      reply_markup: rulesKeyboard,
+      parse_mode: "HTML",
+    });
+  });
+
   // ── Content analysis: spam + offensive (one Gemini call, throttled) ────────
 
   bot.on("message", async (ctx) => {
@@ -947,6 +1057,58 @@ function createBot(env: Env): Bot {
         return; // Stop processing — no need for Gemini analysis
       }
     }
+    // ── Heuristic pre-check (free, runs even when user is throttled) ──────────
+    // Regex-based patterns catch high-confidence spam without spending API quota.
+    // If confident enough, act immediately and skip Gemini entirely.
+
+    const chatTitle = (chat as { title: string }).title;
+    const userMention = from.username
+      ? `@${from.username}`
+      : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
+
+    const heuristic = heuristicAnalysis(text, links);
+    if (heuristic.isSpam && heuristic.spamConfidence >= spamThreshold) {
+      try { await ctx.deleteMessage(); } catch { /* no permission */ }
+
+      const warnings = await incrementWarnings(env.SPAM_KV, chat.id, from.id);
+
+      await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+        `🗑️ <b>SPAM REMOVIDO</b>\n\n` +
+        `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+        `📋 Categoria: <i>${esc(heuristic.spamCategory)}</i>\n` +
+        `📊 Confiança: <b>${Math.round(heuristic.spamConfidence * 100)}%</b>  Aviso spam: <b>${warnings}/${maxWarnings}</b>\n` +
+        `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+      );
+
+      if (warnings >= maxWarnings) {
+        try {
+          await ctx.banChatMember(from.id);
+          await ctx.reply(`🚫 ${userMention} foi banido por spam repetido.`, { parse_mode: "HTML" });
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `🚫 <b>BAN POR SPAM</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `📊 Avisos de spam: <b>${warnings}/${maxWarnings}</b>`
+          );
+        } catch {
+          await ctx.reply(
+            `⛔ ${userMention} atingiu o limite de avisos (${maxWarnings}/${maxWarnings}). ` +
+              `Não tenho permissão para banir — por favor, remova manualmente.`,
+            { parse_mode: "HTML" }
+          );
+        }
+      } else {
+        await ctx.reply(
+          `⚠️ Mensagem de ${userMention} removida por spam.\n` +
+            `📋 Categoria: <i>${heuristic.spamCategory}</i>\n` +
+            `📊 Aviso spam ${warnings}/${maxWarnings}`,
+          { parse_mode: "HTML" }
+        );
+      }
+      return;
+    }
+
+    // ── Throttle + Gemini analysis ────────────────────────────────────────────
+
     if (await isThrottled(env.SPAM_KV, chat.id, from.id)) return;
 
     const geminiSlot = await reserveGeminiChatSlot(
@@ -966,11 +1128,6 @@ function createBot(env: Env): Bot {
 
     // Mark user as recently checked — regardless of result
     await setThrottle(env.SPAM_KV, chat.id, from.id, throttleSeconds);
-
-    const chatTitle = (chat as { title: string }).title;
-    const userMention = from.username
-      ? `@${from.username}`
-      : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
 
     // ── Spam (takes priority over offensive) ─────────────────────────────────
 
