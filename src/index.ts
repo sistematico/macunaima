@@ -953,7 +953,9 @@ function createBot(env: Env): Bot {
     let phrase: string;
     try {
       phrase = await generateIntroPhrase(botFirstName, env.GOOGLE_AI_API_KEY, geminiModel);
-    } catch {
+      if (!phrase) throw new Error("empty response");
+    } catch (err) {
+      console.error("generateIntroPhrase failed:", err);
       phrase = `Oi! Sou o ${botFirstName}, bot de moderação deste grupo. 🤖`;
     }
 

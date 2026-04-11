@@ -17,9 +17,9 @@
     "grammy": "^1.36.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250327.0",
+    "@cloudflare/workers-types": "^4.20260411.1",
     "typescript": "^6.0.2",
-    "wrangler": "^4.11.0"
+    "wrangler": "^4.81.1"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI } from "@google/genai/web";
 import { withRetry } from "./retry";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
