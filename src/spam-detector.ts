@@ -47,7 +47,7 @@ const KEYWORD_TRIGGER_PATTERNS: RegExp[] = [
   // Shortened / obfuscated links anywhere in raw text (with or without https://)
   /(bit\.ly|tinyurl\.com|cutt\.ly|rb\.gy|t\.me\/\+|wa\.me\/|grabify|iplogger)/i,
   // Investment / crypto / trading keywords
-  /\b(cripto|bitcoin|btc|eth|usdt|forex|trader|investimento|invista|ganhe|lucre|renda\s*extra|dinheiro\s*r[aá]pido)\b/i,
+  /\b(cripto|bitcoin|btc|eth|usdt|forex|trader|investimento|invista|ganhe?|ganhos?|lucre?|lucros?|oportunidades?|renda\s*extra|dinheiro\s*r[aá]pido)\b/i,
   // Percentage-gain promises (e.g. "300% em 7 dias", "200% ao mês")
   /\b\d{2,4}\s*%\b/,
   // Urgency / scarcity / exclusive-access phrases
@@ -116,7 +116,11 @@ export function heuristicAnalysis(text: string, links: string[]): ContentAnalysi
   const hasAdultSignal = ADULT_PATTERN.test(haystack);
   const hasScamSignal = SPAM_OR_SCAM_PATTERN.test(haystack);
   const hasMoneyMuleSignal = MONEY_MULE_PATTERN.test(haystack);
-  const hasSuspiciousLink = links.some((l) => SUSPICIOUS_LINK_PATTERN.test(l));
+  // Check both the extracted link array AND the raw text (catches bare "bit.ly/…"
+  // without an https:// prefix that extractLinks would otherwise miss).
+  const hasSuspiciousLink =
+    links.some((l) => SUSPICIOUS_LINK_PATTERN.test(l)) ||
+    SUSPICIOUS_LINK_PATTERN.test(haystack);
 
   if (hasAdultSignal) {
     return {

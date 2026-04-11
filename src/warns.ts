@@ -11,6 +11,8 @@ export type AntiPromotionAction = "warn" | "ban" | "kick" | "delete";
 export interface GroupConfig {
   maxWarns: number;
   punishment: Punishment;
+  /** Whether the bot should detect and remove spam/scam messages (default: true) */
+  spamDetection: boolean;
   /** Whether the bot should auto-warn for offensive content (default: true) */
   offensiveDetection: boolean;
   /** Whether the bot should block promotion of other groups/channels (default: true) */
@@ -26,6 +28,7 @@ export interface GroupConfig {
 const DEFAULT_CONFIG: GroupConfig = {
   maxWarns: 3,
   punishment: "ban",
+  spamDetection: true,
   offensiveDetection: true,
   antiPromotion: true,
   antiPromotionAction: "warn",

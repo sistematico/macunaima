@@ -82,24 +82,31 @@ async function isAdminInChat(
 function configSummary(config: GroupConfig): string {
   return (
     `⚙️ <b>Configuração atual</b>\n\n` +
-    `• Regras: <b>${config.rulesUrl ? "definidas" : "não definidas"}</b>\n` +
-    `• Apagar comandos de não-admin: <b>${config.deleteNonAdminCommands ? "on" : "off"}</b>\n` +
+    `• Anti-spam (IA): <b>${config.spamDetection ? "on" : "off"}</b>\n` +
+    `• Conteúdo ofensivo: <b>${config.offensiveDetection ? "on" : "off"}</b>\n` +
     `• Anti-divulgação: <b>${config.antiPromotion ? "on" : "off"}</b>\n` +
     `• Ação anti-divulgação: <b>${ANTI_PROMOTION_ACTION_LABEL[config.antiPromotionAction]}</b>\n` +
-    `• Conteúdo ofensivo: <b>${config.offensiveDetection ? "on" : "off"}</b>\n` +
+    `• Apagar comandos de não-admin: <b>${config.deleteNonAdminCommands ? "on" : "off"}</b>\n` +
+    `• Regras: <b>${config.rulesUrl ? "definidas" : "não definidas"}</b>\n` +
     `• Warns: <b>${config.maxWarns}</b> | Punição: <b>${PUNISHMENT_LABEL[config.punishment]}</b>`
   );
 }
 
 function configKeyboard(chatId: number, config: GroupConfig): InlineKeyboard {
+  const spamNext = config.spamDetection ? "off" : "on";
   const antiPromotionNext = config.antiPromotion ? "off" : "on";
   const offensiveNext = config.offensiveDetection ? "off" : "on";
   const deleteCommandsNext = config.deleteNonAdminCommands ? "off" : "on";
 
   return new InlineKeyboard()
     .text(
-      `🧹 Comandos não-admin: ${config.deleteNonAdminCommands ? "ON" : "OFF"}`,
-      `cfg:${chatId}:delete_cmds:${deleteCommandsNext}`
+      `🤖 Anti-spam (IA): ${config.spamDetection ? "ON" : "OFF"}`,
+      `cfg:${chatId}:spam_detection:${spamNext}`
+    )
+    .row()
+    .text(
+      `🤬 Conteúdo ofensivo: ${config.offensiveDetection ? "ON" : "OFF"}`,
+      `cfg:${chatId}:offensive:${offensiveNext}`
     )
     .row()
     .text(
@@ -108,8 +115,8 @@ function configKeyboard(chatId: number, config: GroupConfig): InlineKeyboard {
     )
     .row()
     .text(
-      `🤬 Conteúdo ofensivo: ${config.offensiveDetection ? "ON" : "OFF"}`,
-      `cfg:${chatId}:offensive:${offensiveNext}`
+      `🧹 Comandos não-admin: ${config.deleteNonAdminCommands ? "ON" : "OFF"}`,
+      `cfg:${chatId}:delete_cmds:${deleteCommandsNext}`
     )
     .row()
     .text("📜 Definir link de regras", `cfg:${chatId}:rules:set`)
@@ -422,6 +429,11 @@ function createBot(env: Env): Bot {
     if (action === "rules" && value === "clear") {
       await saveConfig(env.SPAM_KV, chatId, { rulesUrl: null });
       await ctx.answerCallbackQuery({ text: "Link de regras removido." });
+    } else if (action === "spam_detection" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, { spamDetection: value === "on" });
+      await ctx.answerCallbackQuery({
+        text: value === "on" ? "Anti-spam ativado." : "Anti-spam desativado.",
+      });
     } else if (action === "anti_promo" && (value === "on" || value === "off")) {
       await saveConfig(env.SPAM_KV, chatId, { antiPromotion: value === "on" });
       await ctx.answerCallbackQuery({ text: "Anti-divulgação atualizada." });
@@ -515,6 +527,37 @@ function createBot(env: Env): Bot {
         { parse_mode: "HTML" }
       )
       .catch(() => undefined);
+  });
+
+  // ── /del | /apagar | /rm | /delete ────────────────────────────────────────
+  // Apaga a mensagem original (aquela à qual o admin respondeu) e o próprio
+  // comando. Só funciona em grupos e apenas para admins.
+
+  bot.command(["del", "apagar", "rm", "delete"], async (ctx) => {
+    if (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup") return;
+    if (!ctx.from) return;
+
+    const isAdmin = await isAdminInChat(ctx.api, ctx.chat.id, ctx.from.id);
+    if (!isAdmin) {
+      const notice = await ctx.reply("❌ Apenas administradores podem usar este comando.", {
+        parse_mode: "HTML",
+      });
+      // Apaga o aviso e o comando após 5 s para não poluir o chat
+      setTimeout(() => {
+        ctx.deleteMessage().catch(() => undefined);
+        ctx.api.deleteMessage(ctx.chat.id, notice.message_id).catch(() => undefined);
+      }, 5000);
+      return;
+    }
+
+    // Apaga o comando do admin
+    await ctx.deleteMessage().catch(() => undefined);
+
+    // Apaga a mensagem original (reply_to_message)
+    const target = ctx.message?.reply_to_message;
+    if (target) {
+      await ctx.api.deleteMessage(ctx.chat.id, target.message_id).catch(() => undefined);
+    }
   });
 
   // ── /setlogchannel ─────────────────────────────────────────────────────────
@@ -1062,6 +1105,10 @@ function createBot(env: Env): Bot {
       ? `@${from.username}`
       : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
 
+    // ── Check if spam detection is enabled for this group ─────────────────────
+    const groupConfig = await getConfig(env.SPAM_KV, chat.id);
+    if (!groupConfig.spamDetection) return;
+
     // ── Keyword pre-filter ────────────────────────────────────────────────────
     // If no suspicious keywords are found, skip analysis entirely (saves quota).
     // Keywords are intentionally broad — the AI makes the final call.
@@ -1142,7 +1189,6 @@ function createBot(env: Env): Bot {
     // ── Offensive content (uses the /warn system, per-group configurable) ─────
 
     if (analysis.isOffensive && analysis.offensiveConfidence >= offensiveThreshold) {
-      const groupConfig = await getConfig(env.SPAM_KV, chat.id);
       if (!groupConfig.offensiveDetection) return;
 
       try { await ctx.deleteMessage(); } catch { /* no permission */ }
