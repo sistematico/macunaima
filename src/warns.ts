@@ -252,17 +252,25 @@ async function resolveTarget(ctx: any): Promise<User | null> {
 
   for (const e of entities) {
     if (e.type === "text_mention") {
-      if (!e.user.is_bot) return e.user;
+      if (!e.user.is_bot) return e.user as User;
       continue;
     }
     if (e.type === "mention") {
       const username = text.slice(e.offset + 1, e.offset + e.length);
       try {
-        const chat = await (ctx.api as Context["api"]).getChat(`@${username}`);
-        if (chat.type === "private") {
-          return { id: chat.id, first_name: chat.first_name, is_bot: false } as User;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const chat = await ctx.api.getChat("@" + username) as any;
+        // Users always have first_name; groups/channels have title instead.
+        if (chat?.id && typeof chat.first_name === "string") {
+          return {
+            id: chat.id as number,
+            first_name: chat.first_name,
+            is_bot: chat.is_bot === true,
+          } as User;
         }
-      } catch { /* unknown username */ }
+      } catch (err) {
+        console.error(`[resolveTarget] getChat(@${username}) failed:`, err);
+      }
     }
   }
 
@@ -339,10 +347,11 @@ export function registerWarnCommands(bot: Bot, env: Env): void {
     const target = await resolveTarget(ctx);
     if (!target) {
       await ctx.reply(
-        "❌ Responda a uma mensagem ou mencione o usuário.\n" +
-        "Exemplos:\n" +
-        "• <code>/warn [motivo]</code> (respondendo a mensagem)\n" +
-        "• <code>/warn @usuário [motivo]</code>",
+        "❌ Não foi possível identificar o usuário.\n\n" +
+        "Use uma destas formas:\n" +
+        "• Responda à mensagem do usuário com <code>/warn [motivo]</code>\n" +
+        "• <code>/warn @usuário [motivo]</code>\n\n" +
+        "<i>Se o @usuário não funcionar, responda a uma mensagem dele.</i>",
         { parse_mode: "HTML" }
       );
       return;
