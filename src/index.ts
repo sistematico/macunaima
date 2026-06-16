@@ -1,7 +1,12 @@
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import type { MessageEntity } from "grammy/types";
-import { analyzeContent } from "./spam-detector";
-import { isThrottled, setThrottle } from "./throttle";
+import { analyzeContent, generateIntroPhrase, hasSpamKeywords, heuristicAnalysis, randomFallbackIntro } from "./spam-detector";
+import {
+  allowFixedWindow,
+  isThrottled,
+  reserveGeminiChatSlot,
+  setThrottle,
+} from "./throttle";
 import { captchaKey, generateCaptcha, type CaptchaData } from "./captcha";
 import {
   checkProfilePhoto,
@@ -11,10 +16,13 @@ import {
 import {
   registerWarnCommands,
   getConfig,
+  saveConfig,
   addWarn,
   clearWarns,
   applyPunishment,
   PUNISHMENT_LABEL,
+  ANTI_PROMOTION_ACTION_LABEL,
+  type GroupConfig,
 } from "./warns";
 import {
   getLogChannel,
@@ -38,7 +46,83 @@ export interface Env {
   PROFILE_CHECK_THRESHOLD: string;
   OFFENSIVE_THRESHOLD: string;
   GEMINI_THROTTLE_SECONDS: string;
+  GEMINI_MAX_CALLS_PER_MINUTE: string;
   SPAM_KV: KVNamespace;
+}
+
+type PrivatePendingAction = {
+  chatId: number;
+  action: "set_rules_url";
+};
+
+const configContextKey = (userId: number) => `config_context:${userId}`;
+const configPendingKey = (userId: number) => `config_pending:${userId}`;
+
+function getCommandName(text: string, entities: MessageEntity[]): string | null {
+  const cmdEntity = entities.find((e) => e.type === "bot_command" && e.offset === 0);
+  if (!cmdEntity) return null;
+
+  const raw = text.slice(1, cmdEntity.length);
+  return raw.split("@")[0]?.toLowerCase() ?? null;
+}
+
+async function isAdminInChat(
+  api: import("grammy").Api,
+  chatId: number,
+  userId: number
+): Promise<boolean> {
+  try {
+    const member = await api.getChatMember(chatId, userId);
+    return member.status === "administrator" || member.status === "creator";
+  } catch {
+    return false;
+  }
+}
+
+function configSummary(config: GroupConfig): string {
+  return (
+    `⚙️ <b>Configuração atual</b>\n\n` +
+    `• Anti-spam (IA): <b>${config.spamDetection ? "on" : "off"}</b>\n` +
+    `• Conteúdo ofensivo: <b>${config.offensiveDetection ? "on" : "off"}</b>\n` +
+    `• Anti-divulgação: <b>${config.antiPromotion ? "on" : "off"}</b>\n` +
+    `• Ação anti-divulgação: <b>${ANTI_PROMOTION_ACTION_LABEL[config.antiPromotionAction]}</b>\n` +
+    `• Apagar comandos de não-admin: <b>${config.deleteNonAdminCommands ? "on" : "off"}</b>\n` +
+    `• Regras: <b>${config.rulesUrl ? "definidas" : "não definidas"}</b>\n` +
+    `• Warns: <b>${config.maxWarns}</b> | Punição: <b>${PUNISHMENT_LABEL[config.punishment]}</b>`
+  );
+}
+
+function configKeyboard(chatId: number, config: GroupConfig): InlineKeyboard {
+  const spamNext = config.spamDetection ? "off" : "on";
+  const antiPromotionNext = config.antiPromotion ? "off" : "on";
+  const offensiveNext = config.offensiveDetection ? "off" : "on";
+  const deleteCommandsNext = config.deleteNonAdminCommands ? "off" : "on";
+
+  return new InlineKeyboard()
+    .text(
+      `🤖 Anti-spam (IA): ${config.spamDetection ? "ON" : "OFF"}`,
+      `cfg:${chatId}:spam_detection:${spamNext}`
+    )
+    .row()
+    .text(
+      `🤬 Conteúdo ofensivo: ${config.offensiveDetection ? "ON" : "OFF"}`,
+      `cfg:${chatId}:offensive:${offensiveNext}`
+    )
+    .row()
+    .text(
+      `🚫 Anti-divulgação: ${config.antiPromotion ? "ON" : "OFF"}`,
+      `cfg:${chatId}:anti_promo:${antiPromotionNext}`
+    )
+    .row()
+    .text(
+      `🧹 Comandos não-admin: ${config.deleteNonAdminCommands ? "ON" : "OFF"}`,
+      `cfg:${chatId}:delete_cmds:${deleteCommandsNext}`
+    )
+    .row()
+    .text("📜 Definir link de regras", `cfg:${chatId}:rules:set`)
+    .text("🗑️ Remover regras", `cfg:${chatId}:rules:clear`)
+    .row()
+    .text("🔄 Atualizar painel", `cfg:${chatId}:refresh`);
 }
 
 // ── KV helpers ────────────────────────────────────────────────────────────────
@@ -78,7 +162,41 @@ function extractLinks(text: string, entities: MessageEntity[]): string[] {
       links.push(entity.url);
     }
   }
-  return links;
+
+  const rawUrlPattern = /(?:https?:\/\/[^\s]+|(?:t\.me|telegram\.me|telegram\.dog)\/[^\s]+)/gi;
+  for (const match of text.matchAll(rawUrlPattern)) {
+    if (match[0]) links.push(match[0]);
+  }
+
+  return Array.from(new Set(links));
+}
+
+// ── Telegram link detection ──────────────────────────────────────────────────
+
+const TELEGRAM_LINK_RE =
+  /(?:https?:\/\/)?(?:t\.me|telegram\.me|telegram\.dog)\/\S+/i;
+
+/**
+ * Returns true if the message contains links to other Telegram groups or
+ * channels (invite links, public group/channel links, etc.).
+ */
+function containsTelegramPromotion(
+  text: string,
+  entities: MessageEntity[]
+): boolean {
+  // Check URL entities
+  for (const entity of entities) {
+    if (entity.type === "url") {
+      const url = text.slice(entity.offset, entity.offset + entity.length);
+      if (TELEGRAM_LINK_RE.test(url)) return true;
+    }
+    if (entity.type === "text_link" && entity.url) {
+      if (TELEGRAM_LINK_RE.test(entity.url)) return true;
+    }
+  }
+  // Check raw text as fallback (obfuscated links without entity)
+  if (TELEGRAM_LINK_RE.test(text)) return true;
+  return false;
 }
 
 // ── Channel resolution helper ─────────────────────────────────────────────────
@@ -122,6 +240,275 @@ function createBot(env: Env): Bot {
   const timeoutMs = timeoutMinutes * 60 * 1000;
   const profileThreshold = parseFloat(env.PROFILE_CHECK_THRESHOLD ?? "0.85");
   const throttleSeconds = parseInt(env.GEMINI_THROTTLE_SECONDS ?? "60", 10);
+  const geminiMaxCallsPerMinute = parseInt(
+    env.GEMINI_MAX_CALLS_PER_MINUTE ?? "12",
+    10
+  );
+
+  const openPrivateConfigPanel = async (
+    userId: number,
+    chatId: number
+  ): Promise<void> => {
+    const chat = await bot.api.getChat(chatId);
+    if (chat.type !== "group" && chat.type !== "supergroup") {
+      await bot.api.sendMessage(userId, "❌ O contexto salvo não é um grupo válido.");
+      return;
+    }
+
+    const config = await getConfig(env.SPAM_KV, chatId);
+    const text =
+      `🛠️ <b>Painel do grupo</b>\n` +
+      `🏠 <b>${esc(chat.title)}</b>\n` +
+      `🆔 <code>${chatId}</code>\n\n` +
+      `${configSummary(config)}\n\n` +
+      `Use os botões abaixo para ajustar.`;
+
+    await bot.api.sendMessage(userId, text, {
+      parse_mode: "HTML",
+      reply_markup: configKeyboard(chatId, config),
+    });
+  };
+
+  const attachGroupContext = async (
+    userId: number,
+    chatId: number,
+    chatTitle: string
+  ): Promise<boolean> => {
+    await env.SPAM_KV.put(configContextKey(userId), String(chatId), {
+      expirationTtl: 60 * 60 * 6,
+    });
+
+    try {
+      await bot.api.sendMessage(
+        userId,
+        `✅ Contexto salvo para <b>${esc(chatTitle)}</b>.\n` +
+          `Abra /config aqui no privado para ajustar as opções do grupo.`,
+        { parse_mode: "HTML" }
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  bot.use(async (ctx, next) => {
+    if (!ctx.chat || !ctx.message) {
+      await next();
+      return;
+    }
+
+    const text = ctx.message.text ?? ctx.message.caption ?? "";
+    const entities = ctx.message.entities ?? ctx.message.caption_entities ?? [];
+    const commandName = getCommandName(text, entities);
+    if (!commandName) {
+      await next();
+      return;
+    }
+
+    if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
+      if (commandName === "start" || commandName === "config") {
+        await ctx.deleteMessage().catch(() => undefined);
+        if (!ctx.from) return;
+
+        const isAdmin = await isAdminInChat(ctx.api, ctx.chat.id, ctx.from.id);
+        if (!isAdmin) return;
+
+        const chatTitle = (ctx.chat as { title: string }).title;
+        const sentInPrivate = await attachGroupContext(
+          ctx.from.id,
+          ctx.chat.id,
+          chatTitle
+        );
+        if (!sentInPrivate) {
+          await ctx
+            .reply(
+              "⚠️ Não consegui te chamar no privado. Abra uma conversa com o bot e envie /start, depois use /config no grupo novamente."
+            )
+            .catch(() => undefined);
+        }
+        return;
+      }
+
+      const groupConfig = await getConfig(env.SPAM_KV, ctx.chat.id);
+      if (groupConfig.deleteNonAdminCommands && ctx.from) {
+        const isAdmin = await isAdminInChat(ctx.api, ctx.chat.id, ctx.from.id);
+        if (!isAdmin) {
+          await ctx.deleteMessage().catch(() => undefined);
+          return;
+        }
+      }
+    }
+
+    await next();
+  });
+
+  // ── /start and /config in private chat ───────────────────────────────────
+
+  bot.command(["start", "config"], async (ctx) => {
+    if (ctx.chat.type !== "private") return;
+    if (!ctx.from) return;
+
+    const allowed = await allowFixedWindow(
+      env.SPAM_KV,
+      `private_config_cmd:${ctx.from.id}`,
+      10,
+      60
+    );
+    if (!allowed) {
+      await ctx.reply("⏳ Muitas tentativas. Aguarde alguns segundos e tente novamente.");
+      return;
+    }
+
+    const contextRaw = await env.SPAM_KV.get(configContextKey(ctx.from.id));
+    if (!contextRaw) {
+      await ctx.reply(
+        "Para abrir o painel, use <code>/config</code> em um grupo onde o bot está ativo.\n" +
+          "Esse comando no grupo é apagado e salva o contexto automaticamente.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const chatId = parseInt(contextRaw, 10);
+    if (Number.isNaN(chatId)) {
+      await env.SPAM_KV.delete(configContextKey(ctx.from.id));
+      await ctx.reply("❌ Contexto inválido. Use /config no grupo novamente.");
+      return;
+    }
+
+    const isAdmin = await isAdminInChat(ctx.api, chatId, ctx.from.id);
+    if (!isAdmin) {
+      await ctx.reply(
+        "❌ Você não é admin do grupo salvo no contexto.\n" +
+          "Use /config no grupo correto para atualizar o contexto."
+      );
+      return;
+    }
+
+    await openPrivateConfigPanel(ctx.from.id, chatId);
+  });
+
+  bot.callbackQuery(/^cfg:(-?\d+):([a-z_]+)(?::([a-z_]+))?$/, async (ctx) => {
+    if (!ctx.from || ctx.chat?.type !== "private") return;
+
+    const allowed = await allowFixedWindow(
+      env.SPAM_KV,
+      `private_config_cb:${ctx.from.id}`,
+      30,
+      60
+    );
+    if (!allowed) {
+      await ctx.answerCallbackQuery({ text: "Aguarde alguns segundos." });
+      return;
+    }
+
+    const chatId = parseInt(ctx.match[1]!, 10);
+    const action = ctx.match[2]!;
+    const value = ctx.match[3] ?? "";
+
+    const isAdmin = await isAdminInChat(ctx.api, chatId, ctx.from.id);
+    if (!isAdmin) {
+      await ctx.answerCallbackQuery({ text: "Você não é admin desse grupo." });
+      return;
+    }
+
+    if (action === "rules" && value === "set") {
+      const pending: PrivatePendingAction = { chatId, action: "set_rules_url" };
+      await env.SPAM_KV.put(configPendingKey(ctx.from.id), JSON.stringify(pending), {
+        expirationTtl: 60 * 5,
+      });
+      await ctx.answerCallbackQuery({ text: "Envie agora o link das regras." });
+      await ctx.reply(
+        "Envie o link completo das regras (ex.: <code>https://...</code>).\n" +
+          "Você tem 5 minutos para concluir.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (action === "rules" && value === "clear") {
+      await saveConfig(env.SPAM_KV, chatId, { rulesUrl: null });
+      await ctx.answerCallbackQuery({ text: "Link de regras removido." });
+    } else if (action === "spam_detection" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, { spamDetection: value === "on" });
+      await ctx.answerCallbackQuery({
+        text: value === "on" ? "Anti-spam ativado." : "Anti-spam desativado.",
+      });
+    } else if (action === "anti_promo" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, { antiPromotion: value === "on" });
+      await ctx.answerCallbackQuery({ text: "Anti-divulgação atualizada." });
+    } else if (action === "offensive" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, { offensiveDetection: value === "on" });
+      await ctx.answerCallbackQuery({ text: "Detecção ofensiva atualizada." });
+    } else if (action === "delete_cmds" && (value === "on" || value === "off")) {
+      await saveConfig(env.SPAM_KV, chatId, {
+        deleteNonAdminCommands: value === "on",
+      });
+      await ctx.answerCallbackQuery({ text: "Filtro de comandos atualizado." });
+    } else if (action !== "refresh") {
+      await ctx.answerCallbackQuery({ text: "Ação inválida." });
+      return;
+    }
+
+    const chat = await ctx.api.getChat(chatId);
+    if (chat.type !== "group" && chat.type !== "supergroup") {
+      await ctx.answerCallbackQuery({ text: "Grupo inválido." });
+      return;
+    }
+
+    const config = await getConfig(env.SPAM_KV, chatId);
+    const text =
+      `🛠️ <b>Painel do grupo</b>\n` +
+      `🏠 <b>${esc(chat.title)}</b>\n` +
+      `🆔 <code>${chatId}</code>\n\n` +
+      `${configSummary(config)}\n\n` +
+      `Use os botões abaixo para ajustar.`;
+
+    await ctx.editMessageText(text, {
+      parse_mode: "HTML",
+      reply_markup: configKeyboard(chatId, config),
+    }).catch(() => undefined);
+  });
+
+  bot.on("message:text", async (ctx, next) => {
+    if (ctx.chat.type !== "private" || !ctx.from) {
+      await next();
+      return;
+    }
+
+    const pending = await env.SPAM_KV.get<PrivatePendingAction>(
+      configPendingKey(ctx.from.id),
+      "json"
+    );
+    if (!pending) {
+      await next();
+      return;
+    }
+
+    if (pending.action !== "set_rules_url") {
+      await env.SPAM_KV.delete(configPendingKey(ctx.from.id));
+      await next();
+      return;
+    }
+
+    const url = (ctx.message.text ?? "").trim();
+    if (!/^https?:\/\/\S+$/i.test(url)) {
+      await ctx.reply("❌ Link inválido. Envie uma URL começando com http:// ou https://");
+      return;
+    }
+
+    const isAdmin = await isAdminInChat(ctx.api, pending.chatId, ctx.from.id);
+    if (!isAdmin) {
+      await env.SPAM_KV.delete(configPendingKey(ctx.from.id));
+      await ctx.reply("❌ Você não é admin desse grupo.");
+      return;
+    }
+
+    await saveConfig(env.SPAM_KV, pending.chatId, { rulesUrl: url });
+    await env.SPAM_KV.delete(configPendingKey(ctx.from.id));
+    await ctx.reply("✅ Link de regras atualizado.");
+    await openPrivateConfigPanel(ctx.from.id, pending.chatId);
+  });
 
   // ── Warn commands ─────────────────────────────────────────────────────────
   registerWarnCommands(bot, env);
@@ -140,6 +527,37 @@ function createBot(env: Env): Bot {
         { parse_mode: "HTML" }
       )
       .catch(() => undefined);
+  });
+
+  // ── /del | /apagar | /rm | /delete ────────────────────────────────────────
+  // Apaga a mensagem original (aquela à qual o admin respondeu) e o próprio
+  // comando. Só funciona em grupos e apenas para admins.
+
+  bot.command(["del", "apagar", "rm", "delete"], async (ctx) => {
+    if (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup") return;
+    if (!ctx.from) return;
+
+    const isAdmin = await isAdminInChat(ctx.api, ctx.chat.id, ctx.from.id);
+    if (!isAdmin) {
+      const notice = await ctx.reply("❌ Apenas administradores podem usar este comando.", {
+        parse_mode: "HTML",
+      });
+      // Apaga o aviso e o comando após 5 s para não poluir o chat
+      setTimeout(() => {
+        ctx.deleteMessage().catch(() => undefined);
+        ctx.api.deleteMessage(ctx.chat.id, notice.message_id).catch(() => undefined);
+      }, 5000);
+      return;
+    }
+
+    // Apaga o comando do admin
+    await ctx.deleteMessage().catch(() => undefined);
+
+    // Apaga a mensagem original (reply_to_message)
+    const target = ctx.message?.reply_to_message;
+    if (target) {
+      await ctx.api.deleteMessage(ctx.chat.id, target.message_id).catch(() => undefined);
+    }
   });
 
   // ── /setlogchannel ─────────────────────────────────────────────────────────
@@ -374,9 +792,20 @@ function createBot(env: Env): Bot {
   bot.callbackQuery(/^captcha:(\d+):(\d+)$/, async (ctx) => {
     const targetUserId = parseInt(ctx.match[1]!, 10);
     const answer = parseInt(ctx.match[2]!, 10);
-    const chat = ctx.chat;
+    const chat = ctx.chat ?? ctx.callbackQuery.message?.chat;
 
     if (!chat) return;
+
+    const allowed = await allowFixedWindow(
+      env.SPAM_KV,
+      `captcha_click:${chat.id}:${ctx.from.id}`,
+      8,
+      30
+    );
+    if (!allowed) {
+      await ctx.answerCallbackQuery({ text: "Muitas tentativas. Aguarde." });
+      return;
+    }
 
     // Only the challenged user may answer
     if (ctx.from.id !== targetUserId) {
@@ -402,6 +831,24 @@ function createBot(env: Env): Bot {
 
     if (answer === data.correct) {
       await ctx.answerCallbackQuery({ text: "✅ Correto! Bem-vindo(a)!" });
+      const config = await getConfig(env.SPAM_KV, chat.id);
+      if (config.rulesUrl) {
+        const rulesKeyboard = new InlineKeyboard().url(
+          "📜 Regras do grupo",
+          config.rulesUrl
+        );
+        await ctx.api
+          .sendMessage(
+            chat.id,
+            `✅ <a href="tg://user?id=${targetUserId}">${data.firstName}</a> concluiu o captcha.\n` +
+              `Leia as regras no botão abaixo:`,
+            {
+              parse_mode: "HTML",
+              reply_markup: rulesKeyboard,
+            }
+          )
+          .catch(() => undefined);
+      }
       await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
         `✅ <b>CAPTCHA APROVADO</b>\n\n` +
         `👤 Usuário: ${ulink(targetUserId, data.firstName)} <code>${targetUserId}</code>`
@@ -427,6 +874,128 @@ function createBot(env: Env): Bot {
     }
   });
 
+  // ── Bot mention → self-introduction ──────────────────────────────────────
+  //
+  // Rate limiting strategy (all backed by KV):
+  //   intro_user:{chatId}:{userId}   — per-user throttle  (10 min)
+  //   intro_debounce:{chatId}        — group debounce: only one reply per minute
+  //   intro_window:{chatId}:{bucket} — 2-min bucket counter for all mentions
+  //   intro_lock:{chatId}            — 1-hour silence when spam detected (> 5/2 min)
+  //
+  // Mention counting always runs (even when throttled/debounced), so abusers
+  // who rotate messages still trip the spam lockout.
+
+  const INTRO_SPAM_LIMIT = 5;          // max mentions per 2-min window before lockout
+  const INTRO_WINDOW_SECONDS = 120;    // window size for spam counting
+  const INTRO_LOCKOUT_SECONDS = 3600;  // 1 hour lockout on spam
+  const INTRO_USER_TTL = 600;          // 10-min per-user throttle
+  const INTRO_DEBOUNCE_TTL = 60;       // 60-second group debounce
+
+  bot.on("message", async (ctx) => {
+    const { chat, from, message } = ctx;
+
+    if (chat.type !== "group" && chat.type !== "supergroup") return;
+    if (!from || from.is_bot) return;
+
+    const text = message.text ?? message.caption ?? "";
+    const entities = message.entities ?? message.caption_entities ?? [];
+
+    // Detect mention of bot by @username (entity) or by first name in text
+    const botUsername = ctx.me.username ?? "";
+    const botFirstName = ctx.me.first_name;
+    const mentionedByEntity = entities.some(
+      (e) =>
+        e.type === "mention" &&
+        text.slice(e.offset, e.offset + e.length).toLowerCase() ===
+          `@${botUsername.toLowerCase()}`
+    );
+    const nameEscaped = botFirstName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mentionedByName =
+      botFirstName.length >= 3 &&
+      new RegExp(`\\b${nameEscaped}\\b`, "i").test(text);
+
+    if (!mentionedByEntity && !mentionedByName) return;
+
+    // ── Idempotency guard (dedup + all throttles in one parallel read) ────
+    // All KV reads run in parallel to minimise latency and reduce the window
+    // in which Telegram could retry the webhook and cause a double reply.
+    const dedupKey    = `intro_sent:${chat.id}:${message.message_id}`;
+    const lockKey     = `intro_lock:${chat.id}`;
+    const userKey     = `intro_user:${chat.id}:${from.id}`;
+    const debounceKey = `intro_debounce:${chat.id}`;
+
+    const [dedup, lock, userThrottle, debounce] = await Promise.all([
+      env.SPAM_KV.get(dedupKey),
+      env.SPAM_KV.get(lockKey),
+      env.SPAM_KV.get(userKey),
+      env.SPAM_KV.get(debounceKey),
+    ]);
+
+    if (dedup !== null || lock !== null || userThrottle !== null || debounce !== null) return;
+
+    // Write all guards atomically before doing any slow work
+    await Promise.all([
+      env.SPAM_KV.put(dedupKey,    "1", { expirationTtl: 300 }),
+      env.SPAM_KV.put(userKey,     "1", { expirationTtl: INTRO_USER_TTL }),
+      env.SPAM_KV.put(debounceKey, "1", { expirationTtl: INTRO_DEBOUNCE_TTL }),
+    ]);
+
+    // ── Count mention towards spam window (fire-and-forget) ───────────────
+    const bucket    = Math.floor(Date.now() / 1000 / INTRO_WINDOW_SECONDS);
+    const windowKey = `intro_window:${chat.id}:${bucket}`;
+    env.SPAM_KV.get(windowKey).then(async (raw) => {
+      const count = parseInt(raw ?? "0", 10) + 1;
+      await env.SPAM_KV.put(windowKey, String(count), {
+        expirationTtl: Math.max(60, INTRO_WINDOW_SECONDS + 10),
+      });
+      if (count > INTRO_SPAM_LIMIT) {
+        await env.SPAM_KV.put(lockKey, "1", { expirationTtl: INTRO_LOCKOUT_SECONDS });
+      }
+    }).catch(() => undefined);
+
+    // ── Reply immediately with a fallback, then try to edit with AI phrase ─
+    // Sending the fallback first ensures Telegram gets a fast response and
+    // never retries the webhook, eliminating the duplicate-message problem.
+    const fallback = randomFallbackIntro(botFirstName);
+    const sent = await ctx.reply(fallback).catch(() => null);
+
+    if (sent) {
+      generateIntroPhrase(botFirstName, env.GOOGLE_AI_API_KEY, geminiModel)
+        .then((aiPhrase) => {
+          if (aiPhrase && aiPhrase !== fallback) {
+            ctx.api
+              .editMessageText(chat.id, sent.message_id, aiPhrase)
+              .catch(() => undefined);
+          }
+        })
+        .catch((err) => console.error("generateIntroPhrase failed:", err));
+    }
+  });
+
+  // ── Rules request detection ───────────────────────────────────────────────
+
+  const RULES_REQUEST_PATTERN =
+    /\b(regras?\s*do\s*grupo|regras?\s*da\s*comunidade|quais?\s*s[aã]o\s*as\s*regras?|onde\s*(est[aá]|ficam?|t[eê]m?)\s*as\s*regras?|tem\s*regras?\s*aqui|regras?\s*do\s*chat|ver\s*as?\s*regras?|link\s*(das?|de)\s*regras?)\b/i;
+
+  bot.on("message", async (ctx) => {
+    const { chat, from, message } = ctx;
+
+    if (chat.type !== "group" && chat.type !== "supergroup") return;
+    if (!from || from.is_bot) return;
+
+    const text = message.text ?? message.caption ?? "";
+    if (!RULES_REQUEST_PATTERN.test(text)) return;
+
+    const config = await getConfig(env.SPAM_KV, chat.id);
+    if (!config.rulesUrl) return;
+
+    const rulesKeyboard = new InlineKeyboard().url("📜 Regras do grupo", config.rulesUrl);
+    await ctx.reply("📜 Aqui estão as regras do grupo:", {
+      reply_markup: rulesKeyboard,
+      parse_mode: "HTML",
+    });
+  });
+
   // ── Content analysis: spam + offensive (one Gemini call, throttled) ────────
 
   bot.on("message", async (ctx) => {
@@ -436,34 +1005,156 @@ function createBot(env: Env): Bot {
     if (!from || from.is_bot) return;
 
     const text = message.text ?? message.caption ?? "";
-    if (text.length < 8) return;
+    const entities = message.entities ?? message.caption_entities ?? [];
+    const links = extractLinks(text, entities);
+    const compactText = text.replace(/\s+/g, "").trim();
+
+    // Skip only truly empty/noise messages. Short text can still be spam (BET, golpe, links).
+    if (compactText.length < 3 && links.length === 0) return;
 
     try {
       const member = await ctx.getChatMember(from.id);
       if (member.status === "administrator" || member.status === "creator") return;
     } catch { /* proceed */ }
 
-    // Skip if this user was already checked recently
-    if (await isThrottled(env.SPAM_KV, chat.id, from.id)) return;
+    // ── Anti-promotion check (before Gemini, no API cost) ──────────────────
 
-    const entities = message.entities ?? message.caption_entities ?? [];
-    const links = extractLinks(text, entities);
+    if (containsTelegramPromotion(text, entities)) {
+      const groupConfig = await getConfig(env.SPAM_KV, chat.id);
+      if (groupConfig.antiPromotion) {
+        const chatTitle = (chat as { title: string }).title;
+        const userMention = from.username
+          ? `@${from.username}`
+          : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
 
-    let analysis: Awaited<ReturnType<typeof analyzeContent>>;
-    try {
-      analysis = await analyzeContent(text, links, env.GOOGLE_AI_API_KEY, geminiModel);
-    } catch (err) {
-      console.error("Gemini analysis failed:", err);
-      return;
+        try { await ctx.deleteMessage(); } catch { /* no permission */ }
+
+        const action = groupConfig.antiPromotionAction;
+
+        if (action === "warn") {
+          const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id, chatTitle, "Divulgação de grupo/canal");
+
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO BLOQUEADA</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `📊 Avisos: <b>${warnCount}/${groupConfig.maxWarns}</b>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+
+          if (warnCount >= groupConfig.maxWarns) {
+            try {
+              await applyPunishment(ctx.api, chat.id, from.id, groupConfig.punishment);
+              await clearWarns(env.SPAM_KV, chat.id, from.id, chatTitle);
+              await ctx.reply(
+                `🚫 ${userMention} atingiu <b>${warnCount}/${groupConfig.maxWarns}</b> avisos.\n` +
+                  `Punição: <b>${PUNISHMENT_LABEL[groupConfig.punishment]}</b>\n` +
+                  `📝 Motivo: <i>divulgação de grupo/canal</i>`,
+                { parse_mode: "HTML" }
+              );
+            } catch {
+              await ctx.reply(
+                `⛔ ${userMention} atingiu o limite de avisos. Não tenho permissão para aplicar a punição.`,
+                { parse_mode: "HTML" }
+              );
+            }
+          } else {
+            await ctx.reply(
+              `⚠️ ${userMention} recebeu um aviso por divulgação de grupo/canal.\n` +
+                `📊 Avisos: <b>${warnCount}/${groupConfig.maxWarns}</b>`,
+              { parse_mode: "HTML" }
+            );
+          }
+        } else if (action === "ban") {
+          try {
+            await ctx.api.banChatMember(chat.id, from.id);
+            await ctx.reply(
+              `🚫 ${userMention} foi banido por divulgação de grupo/canal.`,
+              { parse_mode: "HTML" }
+            );
+          } catch {
+            await ctx.reply(
+              `⛔ Não tenho permissão para banir ${userMention}.`,
+              { parse_mode: "HTML" }
+            );
+          }
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO — BAN</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+        } else if (action === "kick") {
+          try {
+            await ctx.api.banChatMember(chat.id, from.id);
+            await ctx.api.unbanChatMember(chat.id, from.id);
+            await ctx.reply(
+              `🚫 ${userMention} foi removido por divulgação de grupo/canal.`,
+              { parse_mode: "HTML" }
+            );
+          } catch {
+            await ctx.reply(
+              `⛔ Não tenho permissão para remover ${userMention}.`,
+              { parse_mode: "HTML" }
+            );
+          }
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO — KICK</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+        } else {
+          // action === "delete" — message already deleted above
+          await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
+            `📢 <b>DIVULGAÇÃO APAGADA</b>\n\n` +
+            `👤 Usuário: ${ulink(from.id, from.first_name)} <code>${from.id}</code>\n` +
+            `✂️ Trecho: <i>${esc(text.slice(0, 120))}${text.length > 120 ? "…" : ""}</i>`
+          );
+        }
+        return; // Stop processing — no need for Gemini analysis
+      }
     }
-
-    // Mark user as recently checked — regardless of result
-    await setThrottle(env.SPAM_KV, chat.id, from.id, throttleSeconds);
-
     const chatTitle = (chat as { title: string }).title;
     const userMention = from.username
       ? `@${from.username}`
       : `<a href="tg://user?id=${from.id}">${from.first_name}</a>`;
+
+    // ── Check if spam detection is enabled for this group ─────────────────────
+    const groupConfig = await getConfig(env.SPAM_KV, chat.id);
+    if (!groupConfig.spamDetection) return;
+
+    // ── Keyword pre-filter ────────────────────────────────────────────────────
+    // If no suspicious keywords are found, skip analysis entirely (saves quota).
+    // Keywords are intentionally broad — the AI makes the final call.
+
+    if (!hasSpamKeywords(text, links)) return;
+
+    // ── Gemini analysis (rate-limited per chat) ───────────────────────────────
+    // Per-user throttle is intentionally skipped: when keywords are present the
+    // message is suspicious enough to always warrant an AI check, regardless of
+    // how recently we analysed this user. The per-chat slot limit prevents abuse.
+
+    const geminiSlot = await reserveGeminiChatSlot(
+      env.SPAM_KV,
+      chat.id,
+      geminiMaxCallsPerMinute
+    );
+
+    let analysis: Awaited<ReturnType<typeof analyzeContent>>;
+
+    if (!geminiSlot) {
+      // No Gemini slot available — fall back to heuristic only.
+      analysis = heuristicAnalysis(text, links);
+    } else {
+      try {
+        analysis = await analyzeContent(text, links, env.GOOGLE_AI_API_KEY, geminiModel);
+      } catch (err) {
+        console.error("Gemini analysis failed:", err);
+        // Fall back to heuristic so spam is not silently ignored.
+        analysis = heuristicAnalysis(text, links);
+      }
+
+      // Mark user as recently seen (informational — no longer a hard gate).
+      await setThrottle(env.SPAM_KV, chat.id, from.id, throttleSeconds);
+    }
 
     // ── Spam (takes priority over offensive) ─────────────────────────────────
 
@@ -510,12 +1201,11 @@ function createBot(env: Env): Bot {
     // ── Offensive content (uses the /warn system, per-group configurable) ─────
 
     if (analysis.isOffensive && analysis.offensiveConfidence >= offensiveThreshold) {
-      const groupConfig = await getConfig(env.SPAM_KV, chat.id);
       if (!groupConfig.offensiveDetection) return;
 
       try { await ctx.deleteMessage(); } catch { /* no permission */ }
 
-      const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id);
+      const warnCount = await addWarn(env.SPAM_KV, chat.id, from.id, chatTitle, `Conteúdo ofensivo automático: ${analysis.offensiveCategory}`);
 
       await sendLog(ctx.api, env.SPAM_KV, chat.id, chatTitle,
         `🤬 <b>CONTEÚDO OFENSIVO REMOVIDO</b>\n\n` +
@@ -529,7 +1219,7 @@ function createBot(env: Env): Bot {
       if (warnCount >= groupConfig.maxWarns) {
         try {
           await applyPunishment(ctx.api, chat.id, from.id, groupConfig.punishment);
-          await clearWarns(env.SPAM_KV, chat.id, from.id);
+          await clearWarns(env.SPAM_KV, chat.id, from.id, chatTitle);
           await ctx.reply(
             `🚫 ${userMention} atingiu <b>${warnCount}/${groupConfig.maxWarns}</b> avisos.\n` +
               `Punição: <b>${PUNISHMENT_LABEL[groupConfig.punishment]}</b>\n` +

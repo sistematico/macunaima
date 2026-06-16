@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai/web";
 import { withRetry } from "./retry";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -11,6 +11,178 @@ export interface ContentAnalysis {
   offensiveConfidence: number;
   offensiveCategory: string;
   reason: string;
+}
+
+const DEFAULT_ANALYSIS: ContentAnalysis = {
+  isSpam: false,
+  spamConfidence: 0,
+  spamCategory: "legitimate",
+  isOffensive: false,
+  offensiveConfidence: 0,
+  offensiveCategory: "clean",
+  reason: "Sem sinais de abuso",
+};
+
+const SPAM_OR_SCAM_PATTERN =
+  /\b(bet|bets|cassino|aposta|apostas|slot|roleta|tigrinho|jogo\s*do\s*tigre|golpe|golpista|fraude|phishing|hacke|cart[aã]o\s*clonado|pix\s*gr[aá]tis|renda\s*extra|trader|forex|cripto|bitcoin|sinal\s*vip|grupo\s*vip|empr[eé]stimo\s*f[aá]cil)\b/i;
+
+// Money-mule / account-farming patterns: sharing accounts with betting/financial platforms
+// for a percentage cut, with no upfront payment. These phrases are highly specific to this scam.
+const MONEY_MULE_PATTERN =
+  /sem\s*cobran[cç]a\s*antecipada|minha\s*parte\s*ap[oó]s|ap[oó]s\s*(os\s*)?saques?\s*cai|subindo\s*(at[eé]\s*)?\d+\s*k?\s*(por|na)\s*conta|conta\s*(nova|antiga).*\d+\s*%|acesso\s*da\s*conta.*sem\s*cobran|sem\s*acesso\s*da\s*conta|\b(lavagem|mula\s*financ)/i;
+
+const ADULT_PATTERN =
+  /\b(onlyfans|privacy|conte[úu]do\s*adulto|pack\s*vip|nudes?|sexo|er[oó]tico|acompanhante|escort|gp\b|garota\s*de\s*programa|massagem\s*sensual|webcam\s*adulta|porn[oô])\b/i;
+
+const SUSPICIOUS_LINK_PATTERN =
+  /(bit\.ly|tinyurl\.com|cutt\.ly|rb\.gy|t\.me\/\+|wa\.me\/|grabify|iplogger|discord\.gg)/i;
+
+// ── Keyword pre-filter ─────────────────────────────────────────────────────────
+//
+// Intentionally broad — these patterns cast a wide net so that ANY suspicious
+// message is forwarded to the AI for a final verdict. The AI (not the regex)
+// decides whether the message is actually spam.
+
+const KEYWORD_TRIGGER_PATTERNS: RegExp[] = [
+  // Shortened / obfuscated links anywhere in raw text (with or without https://)
+  /(bit\.ly|tinyurl\.com|cutt\.ly|rb\.gy|t\.me\/\+|wa\.me\/|grabify|iplogger)/i,
+  // Investment / crypto / trading keywords
+  /\b(cripto|bitcoin|btc|eth|usdt|forex|trader|investimento|invista|ganhe?|ganhos?|lucre?|lucros?|oportunidades?|renda\s*extra|dinheiro\s*r[aá]pido)\b/i,
+  // Percentage-gain promises (e.g. "300% em 7 dias", "200% ao mês")
+  /\b\d{2,4}\s*%\b/,
+  // Urgency / scarcity / exclusive-access phrases
+  /(vagas?\s*limitadas?|oportunidade\s*[uú]nica|por\s*tempo\s*limitado|acesso\s*exclusivo|acesse\s*agora|clique\s*agora|entre\s*agora|garantido\s*hoje)/i,
+  // Betting / casino / gambling
+  /\b(bet|bets|cassino|aposta|apostas|slot|roleta|tigrinho|jogo\s*do\s*tigre)\b/i,
+  // Fraud / scam terms
+  /\b(golpe|golpista|fraude|phishing|hacke|pix\s*gr[aá]tis|cart[aã]o\s*clonado)\b/i,
+  // Adult / escort content
+  /\b(onlyfans|privacy|pack\s*vip|nudes?|er[oó]tico|acompanhante|escort|webcam\s*adulta|porn[oô])\b/i,
+  // Money-mule phrases
+  /sem\s*cobran[cç]a\s*antecipada|minha\s*parte\s*ap[oó]s|ap[oó]s\s*(os\s*)?saques?\s*cai/i,
+  // VIP group / signal solicitation
+  /\b(sinal\s*vip|grupo\s*vip|canal\s*vip|empr[eé]stimo\s*f[aá]cil)\b/i,
+];
+
+/**
+ * Returns true if the message contains any keyword that warrants AI analysis.
+ * Intentionally broad — the AI makes the final spam/non-spam verdict.
+ */
+export function hasSpamKeywords(text: string, links: string[]): boolean {
+  const haystack = `${text} ${links.join(" ")}`;
+  return KEYWORD_TRIGGER_PATTERNS.some((p) => p.test(haystack));
+}
+
+function clamp01(value: unknown): number {
+  const n = typeof value === "number" ? value : parseFloat(String(value ?? "0"));
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(1, Math.max(0, n));
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | null {
+  const trimmed = raw.trim();
+  const withoutFences = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(withoutFences) as Record<string, unknown>;
+  } catch {
+    const match = withoutFences.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function normalizeModelOutput(parsed: Record<string, unknown>): ContentAnalysis {
+  return {
+    isSpam: Boolean(parsed.isSpam),
+    spamConfidence: clamp01(parsed.spamConfidence),
+    spamCategory: String(parsed.spamCategory ?? "legitimate"),
+    isOffensive: Boolean(parsed.isOffensive),
+    offensiveConfidence: clamp01(parsed.offensiveConfidence),
+    offensiveCategory: String(parsed.offensiveCategory ?? "clean"),
+    reason: String(parsed.reason ?? "Classificação automática"),
+  };
+}
+
+export function heuristicAnalysis(text: string, links: string[]): ContentAnalysis {
+  const haystack = `${text} ${links.join(" ")}`;
+  const hasAdultSignal = ADULT_PATTERN.test(haystack);
+  const hasScamSignal = SPAM_OR_SCAM_PATTERN.test(haystack);
+  const hasMoneyMuleSignal = MONEY_MULE_PATTERN.test(haystack);
+  // Check both the extracted link array AND the raw text (catches bare "bit.ly/…"
+  // without an https:// prefix that extractLinks would otherwise miss).
+  const hasSuspiciousLink =
+    links.some((l) => SUSPICIOUS_LINK_PATTERN.test(l)) ||
+    SUSPICIOUS_LINK_PATTERN.test(haystack);
+
+  if (hasAdultSignal) {
+    return {
+      isSpam: true,
+      spamConfidence: 0.9,
+      spamCategory: "adult_solicitation",
+      isOffensive: true,
+      offensiveConfidence: 0.86,
+      offensiveCategory: "sexual_explicit",
+      reason: "Padrões de conteúdo sexual/erótico detectados",
+    };
+  }
+
+  if (hasMoneyMuleSignal) {
+    return {
+      isSpam: true,
+      spamConfidence: 0.95,
+      spamCategory: "money_mule_account_farming",
+      isOffensive: false,
+      offensiveConfidence: 0,
+      offensiveCategory: "clean",
+      reason: "Esquema de mula financeira / empréstimo de conta em BET detectado",
+    };
+  }
+
+  if (hasScamSignal || hasSuspiciousLink) {
+    return {
+      isSpam: true,
+      spamConfidence: hasSuspiciousLink ? 0.9 : 0.84,
+      spamCategory: hasSuspiciousLink ? "suspicious_link" : "scam_or_bet",
+      isOffensive: false,
+      offensiveConfidence: 0,
+      offensiveCategory: "clean",
+      reason: "Padrões de golpe/BET/fraude detectados",
+    };
+  }
+
+  return { ...DEFAULT_ANALYSIS };
+}
+
+function mergeAnalyses(model: ContentAnalysis, fallback: ContentAnalysis): ContentAnalysis {
+  return {
+    isSpam: model.isSpam || fallback.isSpam,
+    spamConfidence: Math.max(model.spamConfidence, fallback.spamConfidence),
+    spamCategory:
+      model.spamConfidence >= fallback.spamConfidence
+        ? model.spamCategory
+        : fallback.spamCategory,
+    isOffensive: model.isOffensive || fallback.isOffensive,
+    offensiveConfidence: Math.max(
+      model.offensiveConfidence,
+      fallback.offensiveConfidence
+    ),
+    offensiveCategory:
+      model.offensiveConfidence >= fallback.offensiveConfidence
+        ? model.offensiveCategory
+        : fallback.offensiveCategory,
+    reason:
+      model.reason && model.reason !== DEFAULT_ANALYSIS.reason
+        ? model.reason
+        : fallback.reason,
+  };
 }
 
 // ── Combined prompt ────────────────────────────────────────────────────────────
@@ -35,6 +207,10 @@ Flag as spam if the message is:
 - Adult content solicitation or escort/prostitution offers
 - Repetitive flooding
 - Job scams ("easy money", "work from home" with suspicious links)
+- Gambling/BET ads (sports betting, casino, slots, "tigrinho", sure-win tips)
+- Fraud/scam terms in Portuguese and English (golpe, fraude, phishing, fake support)
+- Money-mule / account-farming schemes: offering to deposit money into someone's betting/bank account in exchange for a percentage of withdrawals, with no upfront payment required ("sem cobrança antecipada", "minha parte após os saques", "subindo X na conta", "conta nova ou antiga", "sem acesso da conta")
+- Account sharing or lending solicitations for financial/betting platforms
 
 NOT spam: normal conversation, questions, legitimate news, opinions, bot commands.
 
@@ -46,6 +222,7 @@ Flag offensive ONLY if the message contains:
 - Explicit hate speech clearly targeting race, ethnicity, religion, gender or sexual orientation
 - Direct, credible personal threats of physical violence against a named person
 - Highly explicit sexual content (graphic descriptions, not just innuendo)
+- Pornographic/erotic solicitation, paid sexual content offers, nudity sales
 - Severe, targeted personal harassment aimed at a specific group member
 
 Do NOT flag:
@@ -81,11 +258,7 @@ export async function analyzeContent(
   apiKey: string,
   model: string
 ): Promise<ContentAnalysis> {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const generativeModel = genAI.getGenerativeModel({
-    model,
-    generationConfig: { responseMimeType: "application/json" },
-  });
+  const ai = new GoogleGenAI({ apiKey });
 
   const linksSection =
     links.length > 0
@@ -97,6 +270,54 @@ export async function analyzeContent(
     linksSection
   );
 
-  const result = await withRetry(() => generativeModel.generateContent(prompt));
-  return JSON.parse(result.response.text().trim()) as ContentAnalysis;
+  const result = await withRetry(() =>
+    ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: { responseMimeType: "application/json" },
+    })
+  );
+  const fallback = heuristicAnalysis(text, links);
+  const parsed = parseJsonObject(result.text ?? "");
+  if (!parsed) return fallback;
+
+  const modelAnalysis = normalizeModelOutput(parsed);
+  return mergeAnalyses(modelAnalysis, fallback);
+}
+
+// ── Self-introduction generator ────────────────────────────────────────────────
+
+// Fallback phrases used when the AI is unavailable or too slow.
+// Varied enough so the bot never feels repetitive on quota errors.
+const FALLBACK_INTROS = [
+  (n: string) => `Oi! Sou o ${n}, guardião deste grupo contra spam e golpes. 🤖`,
+  (n: string) => `${n} presente! Cuido da moderação por aqui — spam, golpes e conteúdo ofensivo não passam.`,
+  (n: string) => `Olá! O ${n} está de olho. Minha função é manter este grupo limpo e seguro.`,
+  (n: string) => `Às suas ordens! Sou o ${n}, bot de moderação — detecto spam, aplico captcha e muito mais.`,
+  (n: string) => `${n} aqui! Deixa comigo a moderação: spam, divulgações e golpes eu resolvo.`,
+];
+
+export function randomFallbackIntro(botName: string): string {
+  const fn = FALLBACK_INTROS[Math.floor(Math.random() * FALLBACK_INTROS.length)]!;
+  return fn(botName);
+}
+
+const INTRO_PROMPT = `Você é {{BOT_NAME}}, um bot de moderação para grupos do Telegram.
+Alguém mencionou seu nome no grupo. Escreva EXATAMENTE UMA frase curta de apresentação em português brasileiro.
+Seja criativo e varie o estilo a cada chamada (formal, descontraído, com metáfora, direto…).
+Mencione brevemente que você modera o grupo (spam, golpes, segurança).
+Sem markdown, sem aspas, sem quebras de linha. Apenas a frase.`;
+
+export async function generateIntroPhrase(
+  botName: string,
+  apiKey: string,
+  model: string
+): Promise<string> {
+  const ai = new GoogleGenAI({ apiKey });
+
+  const prompt = INTRO_PROMPT.replace("{{BOT_NAME}}", botName);
+  const result = await withRetry(() =>
+    ai.models.generateContent({ model, contents: prompt })
+  );
+  return (result.text ?? "").trim();
 }
