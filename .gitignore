@@ -3,3 +3,4 @@ node_modules/
 dist/
 worker-configuration.d.ts
 .dev.vars
+.DS_Store
